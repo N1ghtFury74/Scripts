@@ -7,15 +7,17 @@ This system provides automated deployment of Velociraptor clients across enterpr
 ## Directory Structure
 
 ```
-Velociraptor Deployment Automation/
+VDA/
 ├── README.md                           # This documentation
 ├── Server/
 │   └── Server_Setup.py                 # Distribution server setup
 └── Client/
-    ├── Linux_Client.sh                 # Linux deployment script
-    ├── Windows_Client.ps1              # Windows deployment script
-    ├── linux_deployment_success.webp   # Linux deployment success
-    └── windows_deployment_success.webp # Windows deployment success
+    ├── Linux/
+    │   ├── Linux_Client.sh             # Linux deployment script
+    │   └── linux_deployment_success.webp # Linux deployment success
+    └── Windows/
+        ├── Windows_Client.ps1          # Windows deployment script
+        └── windows_deployment_success.webp # Windows deployment success
 ```
 
 ## System Architecture
@@ -123,12 +125,12 @@ sudo ./Linux_Client.sh --url http://SERVER:9999/linux/v0.74-amd64/ --method auto
 ## Deployment Success Examples
 
 ### Linux Deployment
-![Linux Success](Client/linux_deployment_success.webp)
+![Linux Success](Client/Linux/linux_deployment_success.webp)
 
 **Success Indicators**: Architecture detection, service installation, server connection established
 
 ### Windows Deployment
-![Windows Success](Client/windows_deployment_success.webp)
+![Windows Success](Client/Windows/windows_deployment_success.webp)
 
 **Success Indicators**: MSI installation, Windows service running, server enrollment confirmed
 
