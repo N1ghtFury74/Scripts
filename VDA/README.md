@@ -123,12 +123,12 @@ sudo ./Linux_Client.sh --url http://SERVER:9999/linux/v0.74-amd64/ --method auto
 ## Deployment Success Examples
 
 ### Linux Deployment
-![Linux Success](Client/linux_deployment_success.webp)
+![Linux Success](VDA\Client\Linux\linux_deployment_success.webp)
 
 **Success Indicators**: Architecture detection, service installation, server connection established
 
 ### Windows Deployment
-![Windows Success](Client/windows_deployment_success.webp)
+![Windows Success](VDA\Client\Windows\windows_deployment_success.webp)
 
 **Success Indicators**: MSI installation, Windows service running, server enrollment confirmed
 
