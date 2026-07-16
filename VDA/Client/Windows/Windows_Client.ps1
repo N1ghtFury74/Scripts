@@ -1,1090 +1,987 @@
-<#PSScriptInfo
-.VERSION 1.4
-.GUID 6e4f1ccf-3c3a-4f63-9e77-7a2b4d5e8a15
-#>
-
 <#
 .SYNOPSIS
-Velociraptor Windows Client Automated Installer
+    Velociraptor Windows Client Installer (fixed and Windows PowerShell 5.1 compatible).
 
 .DESCRIPTION
-This PowerShell script automates the deployment of Velociraptor clients on Windows systems
-for incident response and threat hunting operations. It provides intelligent discovery and
-installation of Velociraptor client artifacts from a distribution server.
+    Discovers Velociraptor MSI/EXE artifacts from a distribution server, strictly applies
+    the -Select filter to the artifact filename, downloads the selected artifact, installs
+    it, and verifies the Windows service and PE architecture.
 
-KEY CAPABILITIES:
-- Automatic artifact discovery via manifest.json or HTML scraping
-- Multiple installation methods: MSI (preferred), EXE, or RAW service installation
-- Support for both proper installers and repacked client binaries
-- Breadth-first search crawling for artifact discovery from site roots
-- Silent installation with comprehensive error handling
-- Administrator privilege verification and enforcement
-
-INSTALLATION METHODS EXPLAINED:
-- MSI: Standard Windows installer package with silent installation support
-- EXE: Attempts silent installation; falls back to service install for repacked binaries
-- RAW: Direct service installation using Velociraptor's built-in service installer
-
-IMPORTANT NOTES:
-- MSI files are proper Windows installers supporting standard silent switches
-- "Repacked EXE" files are Velociraptor binaries with embedded configurations
-- Repacked EXEs require service installation: velociraptor.exe service install -v
-- Script requires Administrator privileges for service installation
-
-.PARAMETER Url
-Root or artifacts URL (e.g. http://host:9999/ or http://host:9999/windows/v0.74-386/).
-
-.PARAMETER Method
-Install method: auto | msi | exe | raw  (default: auto)
-  auto: prefer MSI (repacked name first), then EXE; else falls back to RAW.
-
-.PARAMETER Select
-Token filter (AND-match) when crawling from a root (e.g. "windows 0.74 386").
-
-.PARAMETER Depth
-BFS recursion depth when starting at a root (default: 4).
-
-.PARAMETER Insecure
-Allow self-signed HTTPS certificates (download only).
-
-.PARAMETER AssumeYes
-Non-interactive; auto-approve actions.
-
-.PARAMETER List
-Only list discovered artifacts; do not install.
-
-.PARAMETER Dest
-Staging folder (used mainly by RAW mode). Default: C:\ProgramData\Velociraptor
-
-.PARAMETER Help
-Show embedded help (same content as Get-Help).
+    Key fixes:
+      - No System.Web.HttpUtility dependency.
+      - Correct PowerShell string and regex syntax.
+      - Windows PowerShell 5.1 compatible TLS handling.
+      - Safe breadth-first crawling without array slicing errors.
+      - Strict artifact filtering so amd64 cannot silently fall back to 386.
+      - RAW service installation receives the source URL explicitly.
+      - MSI logs are preserved outside the temporary download directory.
 
 .EXAMPLE
-# Install from an artifacts folder using MSI (recommended)
-.\client_installation.ps1 -Url http://172.31.94.117:9999/windows/v0.74-386/ -Method msi -AssumeYes
+    .\Windows_Client_Fixed.ps1 -Url "http://44.201.135.251:9999/" `
+        -Select "v0.77.1-amd64" -Method msi -AssumeYes
 
 .EXAMPLE
-# From site root with token filtering (auto will choose MSI if present)
-.\client_installation.ps1 -Url http://172.31.94.117:9999/ -Select "windows 0.74 386" -AssumeYes
-
-.EXAMPLE
-# EXE method: if the EXE is a real installer, run silently; if it's a repacked client EXE (binary),
-# the script will run "service install" automatically.
-.\client_installation.ps1 -Url http://172.31.94.117:9999/windows/v0.74-386/ -Method exe -AssumeYes
-
-.EXAMPLE
-# Dry run (just list what would be used)
-.\client_installation.ps1 -Url http://172.31.94.117:9999/windows/v0.74-386/ -List
-
-.NOTES
-* Run PowerShell as Administrator.
-* If MSI fails, the script prints the path to the detailed MSI log.
+    .\Windows_Client_Fixed.ps1 -Url "http://44.201.135.251:9999/" `
+        -Select "v0.77.1-amd64" -Method msi -List
 #>
 
-# ==================== SCRIPT PARAMETERS ====================
-# Define command-line parameters for script configuration
-# NOTE: $Url is NOT Mandatory so -Help works without prompting for URL
-
+[CmdletBinding()]
 param(
-  # Distribution server URL - can be root URL or direct artifact folder
-  [string]$Url,
+    [Parameter(Mandatory = $true)]
+    [string]$Url,
 
-  # Installation method selection with validation
-  [ValidateSet('auto','msi','exe','raw')]
-  [string]$Method = 'auto',                                # auto = intelligent method selection
-                                                          # msi  = Windows Installer package
-                                                          # exe  = Executable installer or binary
-                                                          # raw  = Direct service installation
+    [ValidateSet('auto', 'msi', 'exe', 'raw')]
+    [string]$Method = 'auto',
 
-  # Token-based filtering for artifact selection when crawling from root
-  [string]$Select = '',                                    # Space-separated AND filter tokens
-                                                          # Example: "windows 0.74 amd64"
+    [string]$Select = '',
 
-  # Breadth-first search depth limit for artifact discovery
-  [int]$Depth = 4,                                        # Maximum crawl depth from root URL
+    [ValidateRange(0, 10)]
+    [int]$Depth = 4,
 
-  # Security and behavior options
-  [switch]$Insecure,                                      # Allow self-signed certificates
-  [switch]$AssumeYes,                                     # Skip confirmation prompts
-  [switch]$List,                                          # List artifacts without installing
+    [switch]$Insecure,
+    [switch]$AssumeYes,
+    [switch]$List,
 
-  # Installation destination for raw method
-  [string]$Dest = 'C:\ProgramData\Velociraptor',          # Staging directory for downloads
-
-  # Help flag for displaying usage information
-  [switch]$Help
+    [string]$Dest = 'C:\ProgramData\Velociraptor'
 )
 
-# ==================== GLOBAL VARIABLES ====================
-# Script-wide variables for configuration and state management
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
 
-# Version and identification
-$ScriptVersion = "1.4"
-$ScriptName = "Velociraptor Windows Client Installer"
+$ScriptVersion = '1.5-fixed'
+$ScriptName = 'Velociraptor Windows Client Installer'
+$UserAgent = "VelociraptorInstaller/$ScriptVersion"
 
-# HTTP client configuration
-$WebClient = $null                                        # Will be initialized in Initialize-WebClient
-$UserAgent = "VelociraptorInstaller/$ScriptVersion"       # User agent for HTTP requests
+$script:WebClient = $null
+$script:TempDirectory = $null
+$script:OriginalCertificateCallback = $null
+$script:SelectionParts = @()
+$script:LastMsiLog = $null
 
-# Installation state tracking
-$DownloadedFiles = @()                                    # Track downloaded files for cleanup
-$TempDirectory = $null                                    # Temporary directory for downloads
-
-# ==================== UTILITY FUNCTIONS ====================
-# Helper functions for logging, error handling, and system operations
-
-# Enhanced logging function with timestamp and color coding
 function Write-Log {
     param(
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [string]$Message,
-        
-        [Parameter(Mandatory=$false)]
+
         [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS', 'DEBUG')]
         [string]$Level = 'INFO'
     )
-    
+
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $logMessage = "[$timestamp] $Level: $Message"
-    
-    # Color coding for different log levels
+    $logMessage = "[$timestamp] ${Level}: $Message"
+
     switch ($Level) {
         'ERROR'   { Write-Host $logMessage -ForegroundColor Red }
         'WARN'    { Write-Host $logMessage -ForegroundColor Yellow }
         'SUCCESS' { Write-Host $logMessage -ForegroundColor Green }
-        'DEBUG'   { Write-Host $logMessage -ForegroundColor Gray }
+        'DEBUG'   { Write-Host $logMessage -ForegroundColor DarkGray }
         default   { Write-Host $logMessage -ForegroundColor White }
     }
 }
 
-# Error handling function that logs and exits
-function Stop-WithError {
-    param([string]$Message)
-    Write-Log -Message $Message -Level 'ERROR'
-    Cleanup-Resources
-    exit 1
-}
-
-# Resource cleanup function
-function Cleanup-Resources {
-    Write-Log -Message "Cleaning up resources..." -Level 'INFO'
-    
-    # Dispose of web client
-    if ($WebClient) {
-        $WebClient.Dispose()
-        $WebClient = $null
-    }
-    
-    # Clean up temporary files if not in List mode
-    if (-not $List -and $TempDirectory -and (Test-Path $TempDirectory)) {
-        try {
-            Remove-Item -Path $TempDirectory -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Log -Message "Temporary directory cleaned up: $TempDirectory" -Level 'DEBUG'
-        }
-        catch {
-            Write-Log -Message "Failed to clean up temporary directory: $($_.Exception.Message)" -Level 'WARN'
-        }
-    }
-}
-
-# Administrator privilege verification
 function Test-Administrator {
-    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object -TypeName Security.Principal.WindowsPrincipal -ArgumentList $identity
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# Ensure administrator privileges for installation operations
 function Assert-Administrator {
     if (-not (Test-Administrator)) {
-        Stop-WithError "This script requires Administrator privileges. Please run PowerShell as Administrator."
+        throw 'This script must be run from an Administrator PowerShell window.'
     }
-    Write-Log -Message "Administrator privileges verified" -Level 'SUCCESS'
 }
 
-# Initialize web client with appropriate security settings
 function Initialize-WebClient {
-    Write-Log -Message "Initializing web client..." -Level 'DEBUG'
-    
-    # Create web client with custom configuration
+    Write-Log -Message 'Initializing web client.' -Level 'DEBUG'
+
     $script:WebClient = New-Object System.Net.WebClient
-    $WebClient.Headers.Add('User-Agent', $UserAgent)
-    
-    # Configure security settings for HTTPS
+    $script:WebClient.Headers.Add('User-Agent', $UserAgent)
+
+    $protocol = [System.Net.SecurityProtocolType]::Tls12
+    $availableProtocols = [Enum]::GetNames([System.Net.SecurityProtocolType])
+    if ($availableProtocols -contains 'Tls13') {
+        $tls13 = [Enum]::Parse([System.Net.SecurityProtocolType], 'Tls13')
+        $protocol = $protocol -bor $tls13
+    }
+    [System.Net.ServicePointManager]::SecurityProtocol = $protocol
+
     if ($Insecure) {
-        Write-Log -Message "Allowing self-signed certificates (insecure mode)" -Level 'WARN'
-        # Bypass certificate validation for self-signed certificates
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
-    }
-    
-    # Set TLS version to support modern servers
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
-    
-    Write-Log -Message "Web client initialized successfully" -Level 'DEBUG'
-}
-
-# ==================== URL AND DISCOVERY FUNCTIONS ====================
-# Functions for URL processing and artifact discovery
-
-# Normalize URL by ensuring proper format and removing trailing slashes
-function Format-Url {
-    param([string]$InputUrl)
-    
-    if (-not $InputUrl) {
-        return $InputUrl
-    }
-    
-    # Ensure protocol is specified
-    if ($InputUrl -notmatch '^https?://') {
-        Write-Log -Message "URL missing protocol, assuming http://" -Level 'WARN'
-        $InputUrl = "http://$InputUrl"
-    }
-    
-    # Remove trailing slashes for consistency
-    $InputUrl = $InputUrl.TrimEnd('/')
-    
-    Write-Log -Message "Normalized URL: $InputUrl" -Level 'DEBUG'
-    return $InputUrl
-}
-
-# Attempt to download and parse manifest.json for artifact metadata
-function Get-ManifestData {
-    param([string]$BaseUrl)
-    
-    $manifestUrl = "$BaseUrl/manifest.json"
-    Write-Log -Message "Attempting to fetch manifest from: $manifestUrl" -Level 'DEBUG'
-    
-    try {
-        # Download manifest content
-        $manifestContent = $WebClient.DownloadString($manifestUrl)
-        
-        # Basic validation that it's JSON-like content
-        if ($manifestContent -match '"version"' -or $manifestContent -match '"files"') {
-            Write-Log -Message "Found valid manifest.json at $manifestUrl" -Level 'INFO'
-            
-            # Parse JSON content
-            $manifestData = $manifestContent | ConvertFrom-Json
-            return $manifestData
-        }
-        else {
-            Write-Log -Message "Invalid manifest format at $manifestUrl" -Level 'DEBUG'
-            return $null
-        }
-    }
-    catch {
-        Write-Log -Message "No manifest found at $manifestUrl" -Level 'DEBUG'
-        return $null
+        Write-Log -Message 'Certificate validation is disabled for this process.' -Level 'WARN'
+        $script:OriginalCertificateCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
     }
 }
 
-# Extract directory links from HTML content using regex parsing
-function Get-DirectoryLinks {
-    param(
-        [string]$HtmlContent,
-        [string]$BaseUrl
-    )
-    
-    $links = @()
-    
-    # Regex pattern to match href attributes pointing to directories
-    $linkPattern = 'href=["\']([^"\']*/?)["\']'
-    $matches = [regex]::Matches($HtmlContent, $linkPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    
-    foreach ($match in $matches) {
-        $href = $match.Groups[1].Value
-        
-        # Skip parent directory links, anchors, and external URLs
-        if ($href -match '^(\.\.?/?|#|https?://)') {
-            continue
-        }
-        
-        # Process directory links (ending with /)
-        if ($href.EndsWith('/')) {
-            $fullUrl = "$BaseUrl/$($href.TrimEnd('/'))"
-            $links += $fullUrl
-        }
-        # Process potential file links for artifact detection
-        elseif ($href -match '\.(msi|exe|yaml|json)$') {
-            $fullUrl = "$BaseUrl/$href"
-            $links += $fullUrl
-        }
-    }
-    
-    # Remove duplicates and return unique links
-    return $links | Sort-Object -Unique
-}
-
-# Breadth-first search implementation for artifact discovery
-function BFS-Find {
-    param(
-        [string]$StartUrl,
-        [string[]]$FilterTokens = @(),
-        [int]$MaxDepth = 4
-    )
-    
-    Write-Log -Message "Starting BFS artifact discovery from: $StartUrl" -Level 'INFO'
-    Write-Log -Message "Filter tokens: $($FilterTokens -join ', ')" -Level 'DEBUG'
-    Write-Log -Message "Maximum depth: $MaxDepth" -Level 'DEBUG'
-    
-    # Initialize BFS data structures
-    $queue = @(@{Url = $StartUrl; Depth = 0})  # Queue of URLs to process
-    $visited = @{}                              # Track visited URLs to avoid cycles
-    $candidates = @()                           # Store potential artifact directories
-    
-    while ($queue.Count -gt 0) {
-        # Dequeue next URL to process
-        $current = $queue[0]
-        $queue = $queue[1..($queue.Count-1)]
-        
-        $currentUrl = $current.Url
-        $currentDepth = $current.Depth
-        
-        # Skip if already visited or depth exceeded
-        if ($visited.ContainsKey($currentUrl) -or $currentDepth -gt $MaxDepth) {
-            continue
-        }
-        
-        $visited[$currentUrl] = $true
-        Write-Log -Message "Processing URL at depth $currentDepth`: $currentUrl" -Level 'DEBUG'
-        
+function Cleanup-Resources {
+    if ($script:WebClient) {
         try {
-            # First, try to get manifest data
-            $manifestData = Get-ManifestData -BaseUrl $currentUrl
-            if ($manifestData) {
-                # Found a manifest - this is likely an artifact directory
-                $candidate = @{
-                    Url = $currentUrl
-                    Manifest = $manifestData
-                    Depth = $currentDepth
-                }
-                
-                # Apply filter tokens if specified
-                if ($FilterTokens.Count -gt 0) {
-                    $urlLower = $currentUrl.ToLower()
-                    $matchesAll = $true
-                    
-                    foreach ($token in $FilterTokens) {
-                        if ($urlLower -notlike "*$($token.ToLower())*") {
-                            $matchesAll = $false
-                            break
-                        }
-                    }
-                    
-                    if ($matchesAll) {
-                        Write-Log -Message "Found matching artifact directory: $currentUrl" -Level 'SUCCESS'
-                        $candidates += $candidate
-                    }
-                    else {
-                        Write-Log -Message "Artifact directory doesn't match filter: $currentUrl" -Level 'DEBUG'
-                    }
-                }
-                else {
-                    # No filter specified, accept any artifact directory
-                    Write-Log -Message "Found artifact directory: $currentUrl" -Level 'SUCCESS'
-                    $candidates += $candidate
-                }
-                
-                # Don't crawl deeper from artifact directories
-                continue
-            }
-            
-            # No manifest found, try to get HTML content for further crawling
-            if ($currentDepth -lt $MaxDepth) {
-                try {
-                    $htmlContent = $WebClient.DownloadString("$currentUrl/")
-                    $links = Get-DirectoryLinks -HtmlContent $htmlContent -BaseUrl $currentUrl
-                    
-                    # Add directory links to queue for further processing
-                    foreach ($link in $links) {
-                        if (-not $visited.ContainsKey($link)) {
-                            $queue += @{Url = $link; Depth = $currentDepth + 1}
-                        }
-                    }
-                    
-                    Write-Log -Message "Found $($links.Count) links at $currentUrl" -Level 'DEBUG'
-                }
-                catch {
-                    Write-Log -Message "Failed to fetch HTML from $currentUrl`: $($_.Exception.Message)" -Level 'DEBUG'
-                }
-            }
+            $script:WebClient.Dispose()
         }
         catch {
-            Write-Log -Message "Error processing $currentUrl`: $($_.Exception.Message)" -Level 'DEBUG'
+            # Ignore cleanup errors.
         }
+        $script:WebClient = $null
     }
-    
-    Write-Log -Message "BFS completed. Found $($candidates.Count) artifact directories." -Level 'INFO'
-    return $candidates
-}
 
-# ==================== ARTIFACT ANALYSIS FUNCTIONS ====================
-# Functions for analyzing and selecting appropriate artifacts
+    if ($Insecure) {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $script:OriginalCertificateCallback
+    }
 
-# Analyze artifacts in a directory and categorize them by type
-function Get-ArtifactInfo {
-    param([string]$ArtifactUrl)
-    
-    Write-Log -Message "Analyzing artifacts at: $ArtifactUrl" -Level 'INFO'
-    
-    $artifacts = @{
-        MSI = @()
-        EXE = @()
-        RAW = @()
-        Config = $null
-        Manifest = $null
-    }
-    
-    try {
-        # Try to get manifest first
-        $manifestData = Get-ManifestData -BaseUrl $ArtifactUrl
-        if ($manifestData) {
-            $artifacts.Manifest = $manifestData
-            Write-Log -Message "Manifest data retrieved successfully" -Level 'DEBUG'
+    if ($script:TempDirectory -and (Test-Path -LiteralPath $script:TempDirectory)) {
+        try {
+            Remove-Item -LiteralPath $script:TempDirectory -Recurse -Force -ErrorAction SilentlyContinue
         }
-        
-        # Get HTML content to find available files
-        $htmlContent = $WebClient.DownloadString("$ArtifactUrl/")
-        $links = Get-DirectoryLinks -HtmlContent $htmlContent -BaseUrl $ArtifactUrl
-        
-        foreach ($link in $links) {
-            $fileName = Split-Path $link -Leaf
-            
-            # Categorize files by extension and naming patterns
-            switch -Regex ($fileName) {
-                '\.msi$' {
-                    $artifacts.MSI += @{
-                        Name = $fileName
-                        Url = $link
-                        IsRepacked = $fileName -match 'Windows_VelociraptorClient'
-                    }
-                    Write-Log -Message "Found MSI: $fileName" -Level 'DEBUG'
-                }
-                '\.exe$' {
-                    $artifacts.EXE += @{
-                        Name = $fileName
-                        Url = $link
-                        IsRepacked = $fileName -match 'Windows_VelociraptorClient'
-                    }
-                    Write-Log -Message "Found EXE: $fileName" -Level 'DEBUG'
-                }
-                'velociraptor.*\.exe$' {
-                    if ($fileName -notmatch 'Windows_VelociraptorClient') {
-                        $artifacts.RAW += @{
-                            Name = $fileName
-                            Url = $link
-                            Type = 'Binary'
-                        }
-                        Write-Log -Message "Found RAW binary: $fileName" -Level 'DEBUG'
-                    }
-                }
-                'client\.config\.yaml$' {
-                    $artifacts.Config = @{
-                        Name = $fileName
-                        Url = $link
-                    }
-                    Write-Log -Message "Found configuration: $fileName" -Level 'DEBUG'
-                }
-            }
+        catch {
+            # Ignore cleanup errors.
         }
-        
-        # Log summary of found artifacts
-        Write-Log -Message "Artifact analysis complete:" -Level 'INFO'
-        Write-Log -Message "  MSI files: $($artifacts.MSI.Count)" -Level 'INFO'
-        Write-Log -Message "  EXE files: $($artifacts.EXE.Count)" -Level 'INFO'
-        Write-Log -Message "  RAW binaries: $($artifacts.RAW.Count)" -Level 'INFO'
-        Write-Log -Message "  Configuration: $(if ($artifacts.Config) { 'Found' } else { 'Not found' })" -Level 'INFO'
-        
-        return $artifacts
-    }
-    catch {
-        Write-Log -Message "Failed to analyze artifacts: $($_.Exception.Message)" -Level 'ERROR'
-        return $null
     }
 }
 
-# Select the best artifact based on method preference and availability
-function Select-BestArtifact {
+function Format-Url {
+    param([Parameter(Mandatory = $true)][string]$InputUrl)
+
+    $result = $InputUrl.Trim()
+    if ($result -notmatch '^https?://') {
+        $result = "http://$result"
+    }
+
+    return $result.TrimEnd('/')
+}
+
+function Get-SelectionParts {
+    param([string]$Selection)
+
+    if ([string]::IsNullOrWhiteSpace($Selection)) {
+        return @()
+    }
+
+    $parts = @()
+    foreach ($rawPart in ($Selection -split '[\s,_-]+')) {
+        $part = $rawPart.Trim().ToLowerInvariant()
+        if (-not $part) {
+            continue
+        }
+
+        if ($part -match '^v\d') {
+            $part = $part.Substring(1)
+        }
+
+        $parts += $part
+    }
+
+    return @($parts | Select-Object -Unique)
+}
+
+function Test-SelectionMatch {
     param(
-        [hashtable]$Artifacts,
-        [string]$PreferredMethod
+        [Parameter(Mandatory = $true)][string]$Text,
+        [string[]]$Parts = @()
     )
-    
-    Write-Log -Message "Selecting best artifact for method: $PreferredMethod" -Level 'INFO'
-    
-    switch ($PreferredMethod) {
-        'msi' {
-            if ($Artifacts.MSI.Count -gt 0) {
-                # Prefer repacked MSI files first
-                $repacked = $Artifacts.MSI | Where-Object { $_.IsRepacked }
-                if ($repacked) {
-                    Write-Log -Message "Selected repacked MSI: $($repacked[0].Name)" -Level 'SUCCESS'
-                    return @{ Type = 'MSI'; Artifact = $repacked[0] }
-                }
-                else {
-                    Write-Log -Message "Selected MSI: $($Artifacts.MSI[0].Name)" -Level 'SUCCESS'
-                    return @{ Type = 'MSI'; Artifact = $Artifacts.MSI[0] }
-                }
-            }
-            else {
-                Write-Log -Message "No MSI files available" -Level 'WARN'
-                return $null
-            }
-        }
-        
-        'exe' {
-            if ($Artifacts.EXE.Count -gt 0) {
-                Write-Log -Message "Selected EXE: $($Artifacts.EXE[0].Name)" -Level 'SUCCESS'
-                return @{ Type = 'EXE'; Artifact = $Artifacts.EXE[0] }
-            }
-            else {
-                Write-Log -Message "No EXE files available" -Level 'WARN'
-                return $null
-            }
-        }
-        
-        'raw' {
-            if ($Artifacts.RAW.Count -gt 0) {
-                Write-Log -Message "Selected RAW binary: $($Artifacts.RAW[0].Name)" -Level 'SUCCESS'
-                return @{ Type = 'RAW'; Artifact = $Artifacts.RAW[0] }
-            }
-            else {
-                Write-Log -Message "No RAW binaries available" -Level 'WARN'
-                return $null
-            }
-        }
-        
-        'auto' {
-            # Auto selection priority: MSI (repacked first) > EXE > RAW
-            
-            # First try repacked MSI
-            $repackedMSI = $Artifacts.MSI | Where-Object { $_.IsRepacked }
-            if ($repackedMSI) {
-                Write-Log -Message "Auto-selected repacked MSI: $($repackedMSI[0].Name)" -Level 'SUCCESS'
-                return @{ Type = 'MSI'; Artifact = $repackedMSI[0] }
-            }
-            
-            # Then try any MSI
-            if ($Artifacts.MSI.Count -gt 0) {
-                Write-Log -Message "Auto-selected MSI: $($Artifacts.MSI[0].Name)" -Level 'SUCCESS'
-                return @{ Type = 'MSI'; Artifact = $Artifacts.MSI[0] }
-            }
-            
-            # Then try EXE
-            if ($Artifacts.EXE.Count -gt 0) {
-                Write-Log -Message "Auto-selected EXE: $($Artifacts.EXE[0].Name)" -Level 'SUCCESS'
-                return @{ Type = 'EXE'; Artifact = $Artifacts.EXE[0] }
-            }
-            
-            # Finally try RAW
-            if ($Artifacts.RAW.Count -gt 0) {
-                Write-Log -Message "Auto-selected RAW binary: $($Artifacts.RAW[0].Name)" -Level 'SUCCESS'
-                return @{ Type = 'RAW'; Artifact = $Artifacts.RAW[0] }
-            }
-            
-            Write-Log -Message "No suitable artifacts found for auto selection" -Level 'ERROR'
-            return $null
-        }
-        
-        default {
-            Write-Log -Message "Unknown method: $PreferredMethod" -Level 'ERROR'
-            return $null
-        }
-    }
-}
 
-# ==================== DOWNLOAD FUNCTIONS ====================
-# Functions for downloading artifacts from the distribution server
-
-# Download a file with progress indication and error handling
-function Download-File {
-    param(
-        [string]$Url,
-        [string]$Destination
-    )
-    
-    Write-Log -Message "Downloading: $(Split-Path $Url -Leaf)" -Level 'INFO'
-    Write-Log -Message "Source: $Url" -Level 'DEBUG'
-    Write-Log -Message "Destination: $Destination" -Level 'DEBUG'
-    
-    try {
-        # Ensure destination directory exists
-        $destDir = Split-Path $Destination -Parent
-        if (-not (Test-Path $destDir)) {
-            New-Item -Path $destDir -ItemType Directory -Force | Out-Null
-        }
-        
-        # Download the file
-        $WebClient.DownloadFile($Url, $Destination)
-        
-        # Verify download success
-        if (-not (Test-Path $Destination) -or (Get-Item $Destination).Length -eq 0) {
-            throw "Downloaded file is empty or missing"
-        }
-        
-        $fileSize = (Get-Item $Destination).Length
-        Write-Log -Message "Successfully downloaded: $(Split-Path $Destination -Leaf) ($fileSize bytes)" -Level 'SUCCESS'
-        
-        # Track downloaded files for cleanup
-        $script:DownloadedFiles += $Destination
-        
+    if (-not $Parts -or $Parts.Count -eq 0) {
         return $true
     }
-    catch {
-        Write-Log -Message "Failed to download $Url`: $($_.Exception.Message)" -Level 'ERROR'
-        return $false
-    }
-}
 
-# ==================== INSTALLATION FUNCTIONS ====================
-# Functions for installing Velociraptor using different methods
+    $target = $Text.ToLowerInvariant()
 
-# Install using Windows Installer (MSI) with silent switches
-function Install-MSI {
-    param([hashtable]$ArtifactInfo)
-    
-    $msiFile = $ArtifactInfo.Artifact.Name
-    $msiPath = Join-Path $TempDirectory $msiFile
-    
-    Write-Log -Message "Installing MSI: $msiFile" -Level 'INFO'
-    
-    # Download MSI file
-    if (-not (Download-File -Url $ArtifactInfo.Artifact.Url -Destination $msiPath)) {
-        return $false
-    }
-    
-    # Create log file for MSI installation
-    $logFile = Join-Path $TempDirectory "msi_install.log"
-    
-    # Build msiexec command with silent switches
-    $msiArgs = @(
-        '/i', "`"$msiPath`""           # Install package
-        '/quiet'                       # Silent installation
-        '/norestart'                   # Don't restart automatically
-        '/l*v', "`"$logFile`""        # Verbose logging
-    )
-    
-    Write-Log -Message "Executing: msiexec $($msiArgs -join ' ')" -Level 'DEBUG'
-    
-    try {
-        # Execute MSI installation
-        $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
-        
-        # Check installation result
-        if ($process.ExitCode -eq 0) {
-            Write-Log -Message "MSI installation completed successfully" -Level 'SUCCESS'
-            return $true
-        }
-        else {
-            Write-Log -Message "MSI installation failed with exit code: $($process.ExitCode)" -Level 'ERROR'
-            
-            # Display log file location for troubleshooting
-            if (Test-Path $logFile) {
-                Write-Log -Message "MSI installation log: $logFile" -Level 'INFO'
-            }
-            
-            return $false
-        }
-    }
-    catch {
-        Write-Log -Message "MSI installation error: $($_.Exception.Message)" -Level 'ERROR'
-        return $false
-    }
-}
-
-# Install using executable installer with multiple silent installation attempts
-function Install-EXE {
-    param([hashtable]$ArtifactInfo)
-    
-    $exeFile = $ArtifactInfo.Artifact.Name
-    $exePath = Join-Path $TempDirectory $exeFile
-    
-    Write-Log -Message "Installing EXE: $exeFile" -Level 'INFO'
-    
-    # Download EXE file
-    if (-not (Download-File -Url $ArtifactInfo.Artifact.Url -Destination $exePath)) {
-        return $false
-    }
-    
-    # Check if this is a repacked Velociraptor binary (not a proper installer)
-    if ($ArtifactInfo.Artifact.IsRepacked -or $exeFile -match '^velociraptor') {
-        Write-Log -Message "Detected repacked Velociraptor binary, using service installation method" -Level 'INFO'
-        return Install-RAW-Service -BinaryPath $exePath
-    }
-    
-    # Try multiple silent installation switches for proper installers
-    $silentSwitches = @('/S', '/SILENT', '/QUIET', '/s', '/silent', '/quiet')
-    
-    foreach ($switch in $silentSwitches) {
-        Write-Log -Message "Attempting silent installation with switch: $switch" -Level 'DEBUG'
-        
-        try {
-            $process = Start-Process -FilePath $exePath -ArgumentList $switch -Wait -PassThru -NoNewWindow
-            
-            if ($process.ExitCode -eq 0) {
-                Write-Log -Message "EXE installation completed successfully with switch: $switch" -Level 'SUCCESS'
-                return $true
-            }
-            else {
-                Write-Log -Message "Installation attempt failed with exit code $($process.ExitCode) using switch: $switch" -Level 'DEBUG'
-            }
-        }
-        catch {
-            Write-Log -Message "Installation attempt error with switch $switch`: $($_.Exception.Message)" -Level 'DEBUG'
-        }
-    }
-    
-    # If all silent installation attempts failed, try service installation as fallback
-    Write-Log -Message "All silent installation attempts failed, trying service installation as fallback" -Level 'WARN'
-    return Install-RAW-Service -BinaryPath $exePath
-}
-
-# Install using direct service installation method
-function Install-RAW {
-    param([hashtable]$ArtifactInfo)
-    
-    $rawFile = $ArtifactInfo.Artifact.Name
-    $rawPath = Join-Path $TempDirectory $rawFile
-    
-    Write-Log -Message "Installing RAW binary: $rawFile" -Level 'INFO'
-    
-    # Download RAW binary
-    if (-not (Download-File -Url $ArtifactInfo.Artifact.Url -Destination $rawPath)) {
-        return $false
-    }
-    
-    return Install-RAW-Service -BinaryPath $rawPath
-}
-
-# Common service installation function for RAW binaries and repacked EXEs
-function Install-RAW-Service {
-    param([string]$BinaryPath)
-    
-    Write-Log -Message "Installing Velociraptor service using binary: $(Split-Path $BinaryPath -Leaf)" -Level 'INFO'
-    
-    # Ensure destination directory exists
-    if (-not (Test-Path $Dest)) {
-        New-Item -Path $Dest -ItemType Directory -Force | Out-Null
-        Write-Log -Message "Created destination directory: $Dest" -Level 'INFO'
-    }
-    
-    # Copy binary to destination
-    $destBinary = Join-Path $Dest "velociraptor.exe"
-    Copy-Item -Path $BinaryPath -Destination $destBinary -Force
-    Write-Log -Message "Binary copied to: $destBinary" -Level 'INFO'
-    
-    # Download configuration file if available
-    $configUrl = "$($ArtifactInfo.Artifact.Url -replace '/[^/]+$', '')/client.config.yaml"
-    $configPath = Join-Path $Dest "client.config.yaml"
-    
-    if (Download-File -Url $configUrl -Destination $configPath) {
-        Write-Log -Message "Configuration downloaded to: $configPath" -Level 'INFO'
-    }
-    else {
-        Write-Log -Message "No configuration file available, service installation may require manual configuration" -Level 'WARN'
-    }
-    
-    # Install service using Velociraptor's built-in service installer
-    try {
-        $serviceArgs = @('service', 'install')
-        if (Test-Path $configPath) {
-            $serviceArgs += @('--config', "`"$configPath`"")
-        }
-        $serviceArgs += '-v'  # Verbose output
-        
-        Write-Log -Message "Executing: `"$destBinary`" $($serviceArgs -join ' ')" -Level 'DEBUG'
-        
-        $process = Start-Process -FilePath $destBinary -ArgumentList $serviceArgs -Wait -PassThru -NoNewWindow
-        
-        if ($process.ExitCode -eq 0) {
-            Write-Log -Message "Velociraptor service installed successfully" -Level 'SUCCESS'
-            return $true
-        }
-        else {
-            Write-Log -Message "Service installation failed with exit code: $($process.ExitCode)" -Level 'ERROR'
-            return $false
-        }
-    }
-    catch {
-        Write-Log -Message "Service installation error: $($_.Exception.Message)" -Level 'ERROR'
-        return $false
-    }
-}
-
-# ==================== SERVICE VERIFICATION FUNCTIONS ====================
-# Functions for verifying successful installation and service status
-
-# Verify that Velociraptor service is installed and running
-function Test-VelociraptorService {
-    Write-Log -Message "Verifying Velociraptor service installation..." -Level 'INFO'
-    
-    # Common Velociraptor service names to check
-    $serviceNames = @('Velociraptor', 'velociraptor', 'VelociraptorClient', 'velociraptor_client')
-    
-    foreach ($serviceName in $serviceNames) {
-        try {
-            $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-            if ($service) {
-                Write-Log -Message "Found Velociraptor service: $($service.Name)" -Level 'SUCCESS'
-                Write-Log -Message "Service status: $($service.Status)" -Level 'INFO'
-                
-                # Try to start service if it's not running
-                if ($service.Status -ne 'Running') {
-                    Write-Log -Message "Starting Velociraptor service..." -Level 'INFO'
-                    try {
-                        Start-Service -Name $service.Name
-                        Start-Sleep -Seconds 3  # Wait for service to start
-                        
-                        $service.Refresh()
-                        if ($service.Status -eq 'Running') {
-                            Write-Log -Message "Velociraptor service started successfully" -Level 'SUCCESS'
-                        }
-                        else {
-                            Write-Log -Message "Service failed to start properly" -Level 'WARN'
-                        }
-                    }
-                    catch {
-                        Write-Log -Message "Failed to start service: $($_.Exception.Message)" -Level 'WARN'
-                    }
+    foreach ($part in $Parts) {
+        switch -Regex ($part) {
+            '^(amd64|x64|x86_64)$' {
+                if ($target -notmatch '(^|[^a-z0-9])(amd64|x64|x86_64)([^a-z0-9]|$)') {
+                    return $false
                 }
-                
-                return $true
+                continue
+            }
+
+            '^(386|i386|x86)$' {
+                if ($target -notmatch '(^|[^a-z0-9])(386|i386|x86)([^a-z0-9]|$)') {
+                    return $false
+                }
+                continue
+            }
+
+            default {
+                if (-not $target.Contains($part)) {
+                    return $false
+                }
             }
         }
-        catch {
-            # Continue checking other service names
+    }
+
+    return $true
+}
+
+function Get-FileNameFromUrl {
+    param([Parameter(Mandatory = $true)][string]$FileUrl)
+
+    $uri = New-Object -TypeName System.Uri -ArgumentList $FileUrl
+    $segment = $uri.Segments[$uri.Segments.Count - 1]
+    return [System.Uri]::UnescapeDataString($segment.TrimEnd('/'))
+}
+
+function Resolve-LinkUrl {
+    param(
+        [Parameter(Mandatory = $true)][string]$BaseUrl,
+        [Parameter(Mandatory = $true)][string]$Href
+    )
+
+    $baseUri = New-Object -TypeName System.Uri -ArgumentList ($BaseUrl.TrimEnd('/') + '/')
+    $decodedHref = [System.Net.WebUtility]::HtmlDecode($Href.Trim())
+    return (New-Object -TypeName System.Uri -ArgumentList $baseUri, $decodedHref).AbsoluteUri.TrimEnd('/')
+}
+
+function Get-HtmlLinks {
+    param(
+        [Parameter(Mandatory = $true)][string]$HtmlContent,
+        [Parameter(Mandatory = $true)][string]$BaseUrl
+    )
+
+    $results = @()
+    $seen = @{}
+
+    # Single quotes inside a PowerShell single-quoted string are represented by two single quotes.
+    $linkPattern = 'href\s*=\s*["''](?<href>[^"'']+)["'']'
+    $matches = [regex]::Matches(
+        $HtmlContent,
+        $linkPattern,
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+
+    $baseUri = New-Object -TypeName System.Uri -ArgumentList ($BaseUrl.TrimEnd('/') + '/')
+
+    foreach ($match in $matches) {
+        $href = [System.Net.WebUtility]::HtmlDecode($match.Groups['href'].Value.Trim())
+
+        if (-not $href -or
+            $href.StartsWith('#') -or
+            $href.StartsWith('?') -or
+            $href.StartsWith('mailto:', [System.StringComparison]::OrdinalIgnoreCase) -or
+            $href.StartsWith('javascript:', [System.StringComparison]::OrdinalIgnoreCase) -or
+            $href -eq '../' -or
+            $href -eq './') {
             continue
         }
+
+        try {
+            $resolvedUri = New-Object -TypeName System.Uri -ArgumentList $baseUri, $href
+        }
+        catch {
+            continue
+        }
+
+        if ($resolvedUri.Scheme -ne 'http' -and $resolvedUri.Scheme -ne 'https') {
+            continue
+        }
+
+        # Do not crawl external hosts.
+        if ($resolvedUri.Authority -ne $baseUri.Authority) {
+            continue
+        }
+
+        $absoluteUrl = $resolvedUri.AbsoluteUri.TrimEnd('/')
+        if ($seen.ContainsKey($absoluteUrl)) {
+            continue
+        }
+        $seen[$absoluteUrl] = $true
+
+        $path = $resolvedUri.AbsolutePath
+        $isArtifact = $path -match '(?i)\.(msi|exe)$'
+        $isConfig = $path -match '(?i)client\.config\.ya?ml$'
+        $isDirectory = $href.EndsWith('/') -or (-not $isArtifact -and -not $isConfig -and -not [IO.Path]::HasExtension($path))
+
+        $results += [pscustomobject]@{
+            Url         = $absoluteUrl
+            IsArtifact  = $isArtifact
+            IsConfig    = $isConfig
+            IsDirectory = $isDirectory
+        }
     }
-    
-    Write-Log -Message "No Velociraptor service found" -Level 'WARN'
+
+    return @($results)
+}
+
+function Get-ManifestLinks {
+    param([Parameter(Mandatory = $true)][string]$BaseUrl)
+
+    $results = @()
+    $manifestUrl = "$($BaseUrl.TrimEnd('/'))/manifest.json"
+
+    try {
+        $manifestText = $script:WebClient.DownloadString($manifestUrl)
+    }
+    catch {
+        return @()
+    }
+
+    $pattern = '(?i)["''](?<path>[^"'']+\.(?:msi|exe|ya?ml))["'']'
+    $matches = [regex]::Matches($manifestText, $pattern)
+    $seen = @{}
+
+    foreach ($match in $matches) {
+        $path = $match.Groups['path'].Value
+        try {
+            $resolved = Resolve-LinkUrl -BaseUrl $BaseUrl -Href $path
+        }
+        catch {
+            continue
+        }
+
+        if ($seen.ContainsKey($resolved)) {
+            continue
+        }
+        $seen[$resolved] = $true
+
+        $results += [pscustomobject]@{
+            Url         = $resolved
+            IsArtifact  = $resolved -match '(?i)\.(msi|exe)$'
+            IsConfig    = $resolved -match '(?i)client\.config\.ya?ml$'
+            IsDirectory = $false
+        }
+    }
+
+    return @($results)
+}
+
+function Get-PageLinks {
+    param([Parameter(Mandatory = $true)][string]$PageUrl)
+
+    $allLinks = @()
+    $seen = @{}
+
+    try {
+        $html = $script:WebClient.DownloadString(($PageUrl.TrimEnd('/') + '/'))
+        foreach ($link in (Get-HtmlLinks -HtmlContent $html -BaseUrl $PageUrl)) {
+            if (-not $seen.ContainsKey($link.Url)) {
+                $seen[$link.Url] = $true
+                $allLinks += $link
+            }
+        }
+    }
+    catch {
+        Write-Log -Message "Could not read directory page $PageUrl. $($_.Exception.Message)" -Level 'DEBUG'
+    }
+
+    foreach ($link in (Get-ManifestLinks -BaseUrl $PageUrl)) {
+        if (-not $seen.ContainsKey($link.Url)) {
+            $seen[$link.Url] = $true
+            $allLinks += $link
+        }
+    }
+
+    return @($allLinks)
+}
+
+function New-ArtifactRecord {
+    param([Parameter(Mandatory = $true)][string]$ArtifactUrl)
+
+    $name = Get-FileNameFromUrl -FileUrl $ArtifactUrl
+    $lower = $name.ToLowerInvariant()
+
+    $type = if ($lower.EndsWith('.msi')) { 'MSI' } else { 'EXE' }
+    $isRepacked = $name -match '(?i)Windows_VelociraptorClient'
+    $isRaw = $type -eq 'EXE' -and -not $isRepacked -and $name -match '(?i)^velociraptor.*\.exe$'
+
+    return [pscustomobject]@{
+        Name       = $name
+        Url        = $ArtifactUrl
+        Type       = $type
+        IsRepacked = $isRepacked
+        IsRaw      = $isRaw
+    }
+}
+
+function Get-ArtifactInfo {
+    param([Parameter(Mandatory = $true)][string]$ArtifactUrl)
+
+    $artifacts = @{
+        MSI    = @()
+        EXE    = @()
+        RAW    = @()
+        Config = $null
+    }
+
+    if ($ArtifactUrl -match '(?i)\.(msi|exe)$') {
+        $record = New-ArtifactRecord -ArtifactUrl $ArtifactUrl
+        if ($record.Type -eq 'MSI') {
+            $artifacts.MSI = @($record)
+        }
+        elseif ($record.IsRaw) {
+            $artifacts.RAW = @($record)
+        }
+        else {
+            $artifacts.EXE = @($record)
+        }
+        return $artifacts
+    }
+
+    $links = Get-PageLinks -PageUrl $ArtifactUrl
+
+    foreach ($link in $links) {
+        if ($link.IsConfig) {
+            $artifacts.Config = [pscustomobject]@{
+                Name = Get-FileNameFromUrl -FileUrl $link.Url
+                Url  = $link.Url
+            }
+            continue
+        }
+
+        if (-not $link.IsArtifact) {
+            continue
+        }
+
+        $record = New-ArtifactRecord -ArtifactUrl $link.Url
+        if ($record.Type -eq 'MSI') {
+            $artifacts.MSI += $record
+        }
+        elseif ($record.IsRaw) {
+            $artifacts.RAW += $record
+        }
+        else {
+            $artifacts.EXE += $record
+        }
+    }
+
+    $artifacts.MSI = @($artifacts.MSI | Sort-Object Name -Unique)
+    $artifacts.EXE = @($artifacts.EXE | Sort-Object Name -Unique)
+    $artifacts.RAW = @($artifacts.RAW | Sort-Object Name -Unique)
+
+    return $artifacts
+}
+
+function Find-ArtifactDirectories {
+    param(
+        [Parameter(Mandatory = $true)][string]$StartUrl,
+        [string[]]$FilterParts = @(),
+        [int]$MaxDepth = 4
+    )
+
+    if ($StartUrl -match '(?i)\.(msi|exe)$') {
+        return @([pscustomobject]@{ Url = $StartUrl; Depth = 0 })
+    }
+
+    $queue = New-Object System.Collections.ArrayList
+    [void]$queue.Add([pscustomobject]@{ Url = $StartUrl; Depth = 0 })
+
+    $visited = @{}
+    $candidateUrls = @{}
+    $candidates = @()
+
+    while ($queue.Count -gt 0) {
+        $current = $queue[0]
+        $queue.RemoveAt(0)
+
+        $currentUrl = $current.Url.TrimEnd('/')
+        $currentDepth = [int]$current.Depth
+
+        if ($currentDepth -gt $MaxDepth -or $visited.ContainsKey($currentUrl)) {
+            continue
+        }
+
+        $visited[$currentUrl] = $true
+        Write-Log -Message "Scanning depth ${currentDepth}: $currentUrl" -Level 'DEBUG'
+
+        $links = Get-PageLinks -PageUrl $currentUrl
+        $artifactLinks = @($links | Where-Object { $_.IsArtifact })
+
+        if ($artifactLinks.Count -gt 0) {
+            $directoryMatches = Test-SelectionMatch -Text $currentUrl -Parts $FilterParts
+            $artifactMatches = @(
+                $artifactLinks | Where-Object {
+                    $name = Get-FileNameFromUrl -FileUrl $_.Url
+                    Test-SelectionMatch -Text $name -Parts $FilterParts
+                }
+            )
+
+            if ($FilterParts.Count -eq 0 -or $directoryMatches -or $artifactMatches.Count -gt 0) {
+                if (-not $candidateUrls.ContainsKey($currentUrl)) {
+                    $candidateUrls[$currentUrl] = $true
+                    $candidates += [pscustomobject]@{
+                        Url   = $currentUrl
+                        Depth = $currentDepth
+                    }
+                    Write-Log -Message "Found artifact directory: $currentUrl" -Level 'SUCCESS'
+                }
+            }
+        }
+
+        if ($currentDepth -ge $MaxDepth) {
+            continue
+        }
+
+        foreach ($link in ($links | Where-Object { $_.IsDirectory })) {
+            if (-not $visited.ContainsKey($link.Url)) {
+                [void]$queue.Add([pscustomobject]@{
+                    Url   = $link.Url
+                    Depth = $currentDepth + 1
+                })
+            }
+        }
+    }
+
+    return @($candidates | Sort-Object Depth, Url)
+}
+
+function Show-AvailableArtifacts {
+    param([Parameter(Mandatory = $true)][hashtable]$Artifacts)
+
+    Write-Host ''
+    Write-Host 'Available artifacts' -ForegroundColor Cyan
+    Write-Host '-------------------' -ForegroundColor Cyan
+
+    foreach ($item in @($Artifacts.MSI)) {
+        Write-Host "MSI : $($item.Name)" -ForegroundColor White
+    }
+    foreach ($item in @($Artifacts.EXE)) {
+        Write-Host "EXE : $($item.Name)" -ForegroundColor White
+    }
+    foreach ($item in @($Artifacts.RAW)) {
+        Write-Host "RAW : $($item.Name)" -ForegroundColor White
+    }
+    if ($Artifacts.Config) {
+        Write-Host "CFG : $($Artifacts.Config.Name)" -ForegroundColor White
+    }
+}
+
+function Select-BestArtifact {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Artifacts,
+        [Parameter(Mandatory = $true)][string]$PreferredMethod,
+        [string[]]$FilterParts = @()
+    )
+
+    $msi = @($Artifacts.MSI)
+    $exe = @($Artifacts.EXE)
+    $raw = @($Artifacts.RAW)
+
+    if ($FilterParts.Count -gt 0) {
+        $msi = @($msi | Where-Object { Test-SelectionMatch -Text $_.Name -Parts $FilterParts })
+        $exe = @($exe | Where-Object { Test-SelectionMatch -Text $_.Name -Parts $FilterParts })
+        $raw = @($raw | Where-Object { Test-SelectionMatch -Text $_.Name -Parts $FilterParts })
+    }
+
+    if ($FilterParts.Count -gt 0 -and ($msi.Count + $exe.Count + $raw.Count) -eq 0) {
+        Write-Log -Message "No artifact filename matches selection: $Select" -Level 'ERROR'
+        Show-AvailableArtifacts -Artifacts $Artifacts
+        return $null
+    }
+
+    switch ($PreferredMethod) {
+        'msi' {
+            $repacked = @($msi | Where-Object { $_.IsRepacked })
+            $chosen = if ($repacked.Count -gt 0) { $repacked[0] } elseif ($msi.Count -gt 0) { $msi[0] } else { $null }
+            if ($chosen) {
+                return @{ Type = 'MSI'; Artifact = $chosen }
+            }
+        }
+
+        'exe' {
+            if ($exe.Count -gt 0) {
+                return @{ Type = 'EXE'; Artifact = $exe[0] }
+            }
+        }
+
+        'raw' {
+            if ($raw.Count -gt 0) {
+                return @{ Type = 'RAW'; Artifact = $raw[0] }
+            }
+        }
+
+        'auto' {
+            $repackedMsi = @($msi | Where-Object { $_.IsRepacked })
+            if ($repackedMsi.Count -gt 0) {
+                return @{ Type = 'MSI'; Artifact = $repackedMsi[0] }
+            }
+            if ($msi.Count -gt 0) {
+                return @{ Type = 'MSI'; Artifact = $msi[0] }
+            }
+            if ($exe.Count -gt 0) {
+                return @{ Type = 'EXE'; Artifact = $exe[0] }
+            }
+            if ($raw.Count -gt 0) {
+                return @{ Type = 'RAW'; Artifact = $raw[0] }
+            }
+        }
+    }
+
+    return $null
+}
+
+function Download-File {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceUrl,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    $parent = Split-Path -Path $Destination -Parent
+    if (-not (Test-Path -LiteralPath $parent)) {
+        New-Item -Path $parent -ItemType Directory -Force | Out-Null
+    }
+
+    Write-Log -Message "Downloading $(Get-FileNameFromUrl -FileUrl $SourceUrl)" -Level 'INFO'
+    $script:WebClient.DownloadFile($SourceUrl, $Destination)
+
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        throw "Download did not create file: $Destination"
+    }
+
+    $length = (Get-Item -LiteralPath $Destination).Length
+    if ($length -le 0) {
+        throw "Downloaded file is empty: $Destination"
+    }
+
+    Write-Log -Message "Download complete: $length bytes" -Level 'SUCCESS'
+}
+
+function Install-MsiArtifact {
+    param([Parameter(Mandatory = $true)][hashtable]$SelectedArtifact)
+
+    $artifact = $SelectedArtifact.Artifact
+    $msiPath = Join-Path $script:TempDirectory $artifact.Name
+    Download-File -SourceUrl $artifact.Url -Destination $msiPath
+
+    $logRoot = Join-Path $env:ProgramData 'Velociraptor\InstallerLogs'
+    New-Item -Path $logRoot -ItemType Directory -Force | Out-Null
+    $logName = 'msi_install_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss')
+    $logFile = Join-Path $logRoot $logName
+    $script:LastMsiLog = $logFile
+
+    $arguments = @(
+        '/i'
+        ('"{0}"' -f $msiPath)
+        '/quiet'
+        '/norestart'
+        '/l*v'
+        ('"{0}"' -f $logFile)
+    )
+
+    Write-Log -Message "Installing MSI: $($artifact.Name)" -Level 'INFO'
+    $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList $arguments -Wait -PassThru
+
+    if ($process.ExitCode -eq 0) {
+        Write-Log -Message 'MSI installation completed successfully.' -Level 'SUCCESS'
+        return $true
+    }
+
+    if ($process.ExitCode -eq 3010) {
+        Write-Log -Message 'MSI installation succeeded; Windows reports that a reboot is required.' -Level 'WARN'
+        return $true
+    }
+
+    Write-Log -Message "MSI installation failed with exit code $($process.ExitCode)." -Level 'ERROR'
+    Write-Log -Message "MSI log: $logFile" -Level 'ERROR'
     return $false
 }
 
-# ==================== MAIN EXECUTION FUNCTIONS ====================
-# Main functions that orchestrate the installation process
+function Install-RawService {
+    param(
+        [Parameter(Mandatory = $true)][string]$BinaryPath,
+        [Parameter(Mandatory = $true)][string]$SourceArtifactUrl
+    )
 
-# Display help information
-function Show-Help {
-    Write-Host @"
-$ScriptName v$ScriptVersion
+    if (-not (Test-Path -LiteralPath $Dest)) {
+        New-Item -Path $Dest -ItemType Directory -Force | Out-Null
+    }
 
-DESCRIPTION:
-    Automates the deployment of Velociraptor clients on Windows systems for incident
-    response and threat hunting operations. Provides intelligent discovery and installation
-    of Velociraptor client artifacts from a distribution server.
+    $destinationBinary = Join-Path $Dest 'velociraptor.exe'
+    Copy-Item -LiteralPath $BinaryPath -Destination $destinationBinary -Force
 
-USAGE:
-    .\Windows_Client.ps1 -Url <URL> [OPTIONS]
+    $sourceDirectory = $SourceArtifactUrl -replace '/[^/]+$', ''
+    $configUrl = "$sourceDirectory/client.config.yaml"
+    $configPath = Join-Path $Dest 'client.config.yaml'
+    $hasConfig = $false
 
-PARAMETERS:
-    -Url <string>           Distribution server URL (required)
-                           Can be root URL or direct artifact folder
-                           
-    -Method <string>        Installation method (default: auto)
-                           auto: Intelligent method selection
-                           msi:  Windows Installer package
-                           exe:  Executable installer
-                           raw:  Direct service installation
-                           
-    -Select <string>        Filter tokens for artifact selection
-                           Space-separated AND filter (e.g. "windows 0.74 amd64")
-                           
-    -Depth <int>           BFS crawl depth (default: 4)
-    -Insecure              Allow self-signed certificates
-    -AssumeYes             Skip confirmation prompts
-    -List                  List artifacts without installing
-    -Dest <string>         Installation directory (default: C:\ProgramData\Velociraptor)
-    -Help                  Show this help message
+    try {
+        Download-File -SourceUrl $configUrl -Destination $configPath
+        $hasConfig = $true
+    }
+    catch {
+        Write-Log -Message 'No separate client.config.yaml was downloaded; the binary may contain an embedded configuration.' -Level 'WARN'
+    }
 
-EXAMPLES:
-    # Install from specific artifact directory
-    .\Windows_Client.ps1 -Url http://server:9999/windows/v0.74-amd64/ -AssumeYes
-    
-    # Auto-discover and install with filtering
-    .\Windows_Client.ps1 -Url http://server:9999/ -Select "windows 0.74 amd64" -AssumeYes
-    
-    # List available artifacts without installing
-    .\Windows_Client.ps1 -Url http://server:9999/ -List
+    if ($hasConfig) {
+        $arguments = @(
+            '--config'
+            ('"{0}"' -f $configPath)
+            'service'
+            'install'
+            '-v'
+        )
+    }
+    else {
+        $arguments = @('service', 'install', '-v')
+    }
 
-NOTES:
-    - Requires Administrator privileges for service installation
-    - MSI method is recommended for production deployments
-    - Use -Insecure flag only for testing with self-signed certificates
+    Write-Log -Message 'Installing Velociraptor service from executable.' -Level 'INFO'
+    $process = Start-Process -FilePath $destinationBinary -ArgumentList $arguments -Wait -PassThru
 
-"@
+    if ($process.ExitCode -eq 0) {
+        Write-Log -Message 'Service installation completed successfully.' -Level 'SUCCESS'
+        return $true
+    }
+
+    Write-Log -Message "Service installation failed with exit code $($process.ExitCode)." -Level 'ERROR'
+    return $false
 }
 
-# Main execution function
-function Main {
-    Write-Log -Message "$ScriptName v$ScriptVersion starting..." -Level 'INFO'
-    
-    # Show help if requested or no URL provided
-    if ($Help -or -not $Url) {
-        Show-Help
-        return
+function Install-ExeArtifact {
+    param([Parameter(Mandatory = $true)][hashtable]$SelectedArtifact)
+
+    $artifact = $SelectedArtifact.Artifact
+    $exePath = Join-Path $script:TempDirectory $artifact.Name
+    Download-File -SourceUrl $artifact.Url -Destination $exePath
+
+    if ($artifact.IsRepacked -or $artifact.IsRaw) {
+        return Install-RawService -BinaryPath $exePath -SourceArtifactUrl $artifact.Url
     }
-    
-    # Verify administrator privileges unless in List mode
+
+    $switchSets = @(
+        @('/quiet', '/norestart'),
+        @('/S'),
+        @('/silent')
+    )
+
+    foreach ($switchSet in $switchSets) {
+        Write-Log -Message "Trying EXE installer arguments: $($switchSet -join ' ')" -Level 'DEBUG'
+        $process = Start-Process -FilePath $exePath -ArgumentList $switchSet -Wait -PassThru
+        if ($process.ExitCode -eq 0 -or $process.ExitCode -eq 3010) {
+            Write-Log -Message 'EXE installation completed successfully.' -Level 'SUCCESS'
+            return $true
+        }
+    }
+
+    Write-Log -Message 'The EXE did not accept the tested silent switches; trying Velociraptor service installation.' -Level 'WARN'
+    return Install-RawService -BinaryPath $exePath -SourceArtifactUrl $artifact.Url
+}
+
+function Get-ServiceBinaryPath {
+    param([Parameter(Mandatory = $true)][string]$PathName)
+
+    $trimmed = $PathName.Trim()
+    if ($trimmed.StartsWith('"')) {
+        $closingQuote = $trimmed.IndexOf('"', 1)
+        if ($closingQuote -gt 1) {
+            return $trimmed.Substring(1, $closingQuote - 1)
+        }
+    }
+
+    $exeIndex = $trimmed.IndexOf('.exe', [System.StringComparison]::OrdinalIgnoreCase)
+    if ($exeIndex -ge 0) {
+        return $trimmed.Substring(0, $exeIndex + 4).Trim('"')
+    }
+
+    return $trimmed
+}
+
+function Get-PeArchitecture {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return 'Unknown'
+    }
+
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $reader = New-Object -TypeName IO.BinaryReader -ArgumentList $stream
+
+        if ($reader.ReadUInt16() -ne 0x5A4D) {
+            return 'Unknown'
+        }
+
+        $stream.Position = 0x3C
+        $peOffset = $reader.ReadInt32()
+        $stream.Position = $peOffset
+
+        if ($reader.ReadUInt32() -ne 0x00004550) {
+            return 'Unknown'
+        }
+
+        $machine = $reader.ReadUInt16()
+        switch ($machine) {
+            0x014c { return 'x86' }
+            0x8664 { return 'x64' }
+            0xAA64 { return 'ARM64' }
+            default { return ('Unknown (0x{0:X4})' -f $machine) }
+        }
+    }
+    catch {
+        return 'Unknown'
+    }
+    finally {
+        if ($reader) { $reader.Dispose() }
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Test-VelociraptorService {
+    param([string[]]$ExpectedSelectionParts = @())
+
+    $service = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '(?i)^Velociraptor(Client)?$' } |
+        Select-Object -First 1
+
+    if (-not $service) {
+        Write-Log -Message 'Velociraptor service was not found.' -Level 'ERROR'
+        return $false
+    }
+
+    if ($service.State -ne 'Running') {
+        try {
+            Start-Service -Name $service.Name
+            Start-Sleep -Seconds 3
+            $service = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $service.Name)
+        }
+        catch {
+            Write-Log -Message "Service exists but could not be started: $($_.Exception.Message)" -Level 'ERROR'
+            return $false
+        }
+    }
+
+    $binaryPath = Get-ServiceBinaryPath -PathName $service.PathName
+    $architecture = Get-PeArchitecture -Path $binaryPath
+
+    Write-Log -Message "Service name: $($service.Name)" -Level 'SUCCESS'
+    Write-Log -Message "Service state: $($service.State)" -Level 'SUCCESS'
+    Write-Log -Message "Binary path: $binaryPath" -Level 'INFO'
+    Write-Log -Message "Binary architecture: $architecture" -Level 'INFO'
+
+    $expectsAmd64 = @($ExpectedSelectionParts | Where-Object { $_ -match '^(amd64|x64|x86_64)$' }).Count -gt 0
+    $expectsX86 = @($ExpectedSelectionParts | Where-Object { $_ -match '^(386|i386|x86)$' }).Count -gt 0
+
+    if ($expectsAmd64 -and $architecture -ne 'x64') {
+        Write-Log -Message "Architecture verification failed: amd64 was requested but the service binary is $architecture." -Level 'ERROR'
+        return $false
+    }
+
+    if ($expectsX86 -and $architecture -ne 'x86') {
+        Write-Log -Message "Architecture verification failed: 386/x86 was requested but the service binary is $architecture." -Level 'ERROR'
+        return $false
+    }
+
+    return $service.State -eq 'Running'
+}
+
+function Main {
     if (-not $List) {
         Assert-Administrator
     }
-    
-    # Initialize web client
+
     Initialize-WebClient
-    
-    # Normalize URL
+
     $normalizedUrl = Format-Url -InputUrl $Url
-    
-    # Parse filter tokens
-    $filterTokens = if ($Select) { $Select.Split(' ', [StringSplitOptions]::RemoveEmptyEntries) } else { @() }
-    
-    Write-Log -Message "Configuration:" -Level 'INFO'
-    Write-Log -Message "  URL: $normalizedUrl" -Level 'INFO'
-    Write-Log -Message "  Method: $Method" -Level 'INFO'
-    Write-Log -Message "  Filter: $($filterTokens -join ', ')" -Level 'INFO'
-    Write-Log -Message "  Depth: $Depth" -Level 'INFO'
-    Write-Log -Message "  List only: $List" -Level 'INFO'
-    
-    # Create temporary directory
-    $script:TempDirectory = Join-Path $env:TEMP "VelociraptorInstall_$(Get-Random)"
-    New-Item -Path $TempDirectory -ItemType Directory -Force | Out-Null
-    Write-Log -Message "Temporary directory: $TempDirectory" -Level 'DEBUG'
-    
-    try {
-        # Discover artifacts
-        Write-Log -Message "Discovering Velociraptor artifacts..." -Level 'INFO'
-        $candidates = BFS-Find -StartUrl $normalizedUrl -FilterTokens $filterTokens -MaxDepth $Depth
-        
-        if ($candidates.Count -eq 0) {
-            Stop-WithError "No Velociraptor artifacts found"
-        }
-        
-        # Select best candidate (first one found)
-        $selectedCandidate = $candidates[0]
-        Write-Log -Message "Selected artifact directory: $($selectedCandidate.Url)" -Level 'SUCCESS'
-        
-        # Analyze artifacts in selected directory
-        $artifactInfo = Get-ArtifactInfo -ArtifactUrl $selectedCandidate.Url
-        if (-not $artifactInfo) {
-            Stop-WithError "Failed to analyze artifacts"
-        }
-        
-        # If List mode, display artifacts and exit
+    $script:SelectionParts = @(Get-SelectionParts -Selection $Select)
+
+    Write-Log -Message "$ScriptName $ScriptVersion" -Level 'INFO'
+    Write-Log -Message "URL: $normalizedUrl" -Level 'INFO'
+    Write-Log -Message "Method: $Method" -Level 'INFO'
+    Write-Log -Message "Selection: $(if ($Select) { $Select } else { '<none>' })" -Level 'INFO'
+    Write-Log -Message "Selection parts: $($script:SelectionParts -join ', ')" -Level 'DEBUG'
+
+    $script:TempDirectory = Join-Path $env:TEMP ("VelociraptorInstall_{0}" -f [Guid]::NewGuid().ToString('N'))
+    New-Item -Path $script:TempDirectory -ItemType Directory -Force | Out-Null
+
+    $candidates = @(Find-ArtifactDirectories -StartUrl $normalizedUrl -FilterParts $script:SelectionParts -MaxDepth $Depth)
+    if ($candidates.Count -eq 0) {
+        throw "No artifact directory matched '$Select' within depth $Depth."
+    }
+
+    $selectedArtifact = $null
+    $selectedCandidate = $null
+    $lastArtifactInfo = $null
+
+    foreach ($candidate in $candidates) {
+        Write-Log -Message "Analyzing: $($candidate.Url)" -Level 'INFO'
+        $artifactInfo = Get-ArtifactInfo -ArtifactUrl $candidate.Url
+        $lastArtifactInfo = $artifactInfo
+
         if ($List) {
-            Write-Host "`nAvailable Artifacts:" -ForegroundColor Cyan
-            Write-Host "===================" -ForegroundColor Cyan
-            
-            if ($artifactInfo.MSI.Count -gt 0) {
-                Write-Host "`nMSI Files:" -ForegroundColor Yellow
-                foreach ($msi in $artifactInfo.MSI) {
-                    $repackedText = if ($msi.IsRepacked) { " (repacked)" } else { "" }
-                    Write-Host "  - $($msi.Name)$repackedText" -ForegroundColor White
-                }
-            }
-            
-            if ($artifactInfo.EXE.Count -gt 0) {
-                Write-Host "`nEXE Files:" -ForegroundColor Yellow
-                foreach ($exe in $artifactInfo.EXE) {
-                    $repackedText = if ($exe.IsRepacked) { " (repacked)" } else { "" }
-                    Write-Host "  - $($exe.Name)$repackedText" -ForegroundColor White
-                }
-            }
-            
-            if ($artifactInfo.RAW.Count -gt 0) {
-                Write-Host "`nRAW Binaries:" -ForegroundColor Yellow
-                foreach ($raw in $artifactInfo.RAW) {
-                    Write-Host "  - $($raw.Name)" -ForegroundColor White
-                }
-            }
-            
-            if ($artifactInfo.Config) {
-                Write-Host "`nConfiguration:" -ForegroundColor Yellow
-                Write-Host "  - $($artifactInfo.Config.Name)" -ForegroundColor White
-            }
-            
+            Write-Host "`nSource: $($candidate.Url)" -ForegroundColor Yellow
+            Show-AvailableArtifacts -Artifacts $artifactInfo
+            continue
+        }
+
+        $possibleSelection = Select-BestArtifact `
+            -Artifacts $artifactInfo `
+            -PreferredMethod $Method `
+            -FilterParts $script:SelectionParts
+
+        if ($possibleSelection) {
+            $selectedArtifact = $possibleSelection
+            $selectedCandidate = $candidate
+            break
+        }
+    }
+
+    if ($List) {
+        return
+    }
+
+    if (-not $selectedArtifact) {
+        if ($lastArtifactInfo) {
+            Show-AvailableArtifacts -Artifacts $lastArtifactInfo
+        }
+        throw "No $Method artifact matched selection '$Select'. The script will not fall back to another version or architecture."
+    }
+
+    Write-Host ''
+    Write-Host 'Installation plan' -ForegroundColor Cyan
+    Write-Host '-----------------' -ForegroundColor Cyan
+    Write-Host "Source directory : $($selectedCandidate.Url)"
+    Write-Host "Method           : $($selectedArtifact.Type)"
+    Write-Host "Artifact         : $($selectedArtifact.Artifact.Name)"
+    Write-Host "Artifact URL     : $($selectedArtifact.Artifact.Url)"
+    Write-Host ''
+
+    if (-not $AssumeYes) {
+        $answer = Read-Host 'Proceed? [Y/N]'
+        if ($answer -notmatch '^[Yy]$') {
+            Write-Log -Message 'Installation cancelled.' -Level 'WARN'
             return
         }
-        
-        # Select best artifact for installation
-        $selectedArtifact = Select-BestArtifact -Artifacts $artifactInfo -PreferredMethod $Method
-        if (-not $selectedArtifact) {
-            Stop-WithError "No suitable artifacts found for method: $Method"
+    }
+
+    $success = $false
+    switch ($selectedArtifact.Type) {
+        'MSI' {
+            $success = Install-MsiArtifact -SelectedArtifact $selectedArtifact
         }
-        
-        # Confirm installation unless AssumeYes is specified
-        if (-not $AssumeYes) {
-            Write-Host "`nInstallation Plan:" -ForegroundColor Cyan
-            Write-Host "=================" -ForegroundColor Cyan
-            Write-Host "Method: $($selectedArtifact.Type)" -ForegroundColor Yellow
-            Write-Host "Artifact: $($selectedArtifact.Artifact.Name)" -ForegroundColor Yellow
-            Write-Host "Source: $($selectedCandidate.Url)" -ForegroundColor Yellow
-            Write-Host ""
-            
-            $confirmation = Read-Host "Proceed with installation? [Y/N]"
-            if ($confirmation -notmatch '^[Yy]') {
-                Write-Log -Message "Installation cancelled by user" -Level 'INFO'
-                return
-            }
+        'EXE' {
+            $success = Install-ExeArtifact -SelectedArtifact $selectedArtifact
         }
-        
-        # Perform installation based on selected artifact type
-        Write-Log -Message "Starting installation..." -Level 'INFO'
-        $installSuccess = $false
-        
-        switch ($selectedArtifact.Type) {
-            'MSI' {
-                $installSuccess = Install-MSI -ArtifactInfo $selectedArtifact
-            }
-            'EXE' {
-                $installSuccess = Install-EXE -ArtifactInfo $selectedArtifact
-            }
-            'RAW' {
-                $installSuccess = Install-RAW -ArtifactInfo $selectedArtifact
-            }
-        }
-        
-        if ($installSuccess) {
-            Write-Log -Message "Installation completed successfully!" -Level 'SUCCESS'
-            
-            # Verify service installation
-            if (Test-VelociraptorService) {
-                Write-Log -Message "Velociraptor service verification completed" -Level 'SUCCESS'
-            }
-            else {
-                Write-Log -Message "Service verification failed - manual verification may be required" -Level 'WARN'
-            }
-            
-            # Display installation summary
-            Write-Host "`nInstallation Summary:" -ForegroundColor Green
-            Write-Host "====================" -ForegroundColor Green
-            Write-Host "✓ Velociraptor client installed successfully" -ForegroundColor Green
-            Write-Host "✓ Service configured and started" -ForegroundColor Green
-            Write-Host "✓ Client ready for server communication" -ForegroundColor Green
-            Write-Host ""
-            Write-Host "Next steps:" -ForegroundColor Cyan
-            Write-Host "- Verify client appears in Velociraptor server console" -ForegroundColor White
-            Write-Host "- Monitor service status: Get-Service *velociraptor*" -ForegroundColor White
-            Write-Host "- Check event logs for any service issues" -ForegroundColor White
-        }
-        else {
-            Stop-WithError "Installation failed"
+        'RAW' {
+            $artifact = $selectedArtifact.Artifact
+            $rawPath = Join-Path $script:TempDirectory $artifact.Name
+            Download-File -SourceUrl $artifact.Url -Destination $rawPath
+            $success = Install-RawService -BinaryPath $rawPath -SourceArtifactUrl $artifact.Url
         }
     }
-    finally {
-        # Cleanup resources
-        Cleanup-Resources
+
+    if (-not $success) {
+        throw 'Installation failed.'
+    }
+
+    if (-not (Test-VelociraptorService -ExpectedSelectionParts $script:SelectionParts)) {
+        throw 'The installation command completed, but service or architecture verification failed.'
+    }
+
+    Write-Host ''
+    Write-Host 'Installation completed and verified.' -ForegroundColor Green
+    if ($script:LastMsiLog) {
+        Write-Host "MSI log: $script:LastMsiLog" -ForegroundColor Gray
     }
 }
-
-# ==================== SCRIPT ENTRY POINT ====================
-# Execute main function with error handling
 
 try {
     Main
 }
 catch {
-    Write-Log -Message "Unhandled error: $($_.Exception.Message)" -Level 'ERROR'
-    Write-Log -Message "Stack trace: $($_.ScriptStackTrace)" -Level 'DEBUG'
-    Cleanup-Resources
+    Write-Log -Message $_.Exception.Message -Level 'ERROR'
+    if ($script:LastMsiLog) {
+        Write-Log -Message "MSI log: $script:LastMsiLog" -Level 'ERROR'
+    }
     exit 1
+}
+finally {
+    Cleanup-Resources
 }
