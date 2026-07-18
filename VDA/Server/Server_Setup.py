@@ -9,7 +9,7 @@ and threat hunting operations. It serves as the central hub for managing client 
 Windows and Linux environments.
 
 WHAT THIS SCRIPT DOES:
-- Downloads the latest Velociraptor releases from GitHub
+- Shows the latest Velociraptor GitHub release and supports selecting any release by version
 - Repacks Windows installers (MSI/EXE) with custom client configurations
 - Builds Linux packages (.deb/.rpm) or creates raw binaries with systemd services
 - Creates a structured web-based artifact repository
@@ -37,7 +37,7 @@ DIRECTORY STRUCTURE CREATED:
 KEY FEATURES:
 - Persistent operation: Creates systemd service for automatic startup
 - Idempotent: Can be run multiple times without breaking existing deployments
-- Version management: Maintains multiple versions simultaneously
+- Version management: Retrieves latest or operator-selected releases and maintains multiple versions simultaneously
 - Cross-platform: Handles both Windows and Linux client generation
 - Web interface: Provides browsable artifact repository
 """
@@ -61,8 +61,9 @@ from typing import Dict, List, Optional, Tuple  # Type hints for better code cla
 
 # GitHub repository information for downloading Velociraptor releases
 GITHUB_REPO = "Velocidex/velociraptor"                                    # Official Velociraptor repository
-API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"  # GitHub API endpoint for latest release
-HTML_RELEASES = f"https://github.com/{GITHUB_REPO}/releases"             # Fallback HTML page for releases
+API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"  # Latest stable release
+API_RELEASE_BY_TAG = f"https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{{tag}}"  # Specific release
+HTML_RELEASES = f"https://github.com/{GITHUB_REPO}/releases"             # GitHub releases page
 
 # Server configuration
 DEFAULT_PORT = 9999                    # Default HTTP server port for serving artifacts
@@ -209,66 +210,236 @@ def request_json(url: str, token: Optional[str] = None) -> Dict:
         with urllib.request.urlopen(req, timeout=30) as r:
             return _json.loads(r.read().decode("utf-8"))
 
-def get_latest_assets_api(token: Optional[str]) -> Tuple[str, List[Dict]]:
+def normalize_release_tag(value: str) -> str:
     """
-    Retrieves the latest Velociraptor release information using GitHub API.
+    Normalizes operator input into a GitHub release tag.
 
-    This is the preferred method as it provides structured data including file sizes
-    and content types. Used for downloading the latest Velociraptor binaries.
-
-    Args:
-        token (Optional[str]): GitHub API token for higher rate limits
-
-    Returns:
-        Tuple[str, List[Dict]]: (release_tag, list_of_asset_dictionaries)
+    Accepted examples:
+        0.77.1
+        v0.77.1
+        https://github.com/Velocidex/velociraptor/releases/tag/v0.77.1
     """
-    # Get latest release data from GitHub API
-    data = request_json(API_LATEST, token=token)
-    tag = data.get("tag_name") or "latest"  # Extract version tag (e.g., "v0.74.1")
-    assets = data.get("assets", []) or []   # Get list of downloadable files
+    value = value.strip().rstrip("/")
+    if not value:
+        raise ValueError("Release version cannot be empty.")
 
-    # Convert GitHub API response to our standardized format
-    out = []
-    for a in assets:
+    # Accept a copied GitHub release URL.
+    if "/releases/tag/" in value:
+        value = value.split("/releases/tag/", 1)[1].split("/", 1)[0]
+
+    if value.lower() == "latest":
+        return "latest"
+
+    # Velociraptor release tags normally begin with "v".
+    if re.match(r"^\d", value):
+        value = f"v{value}"
+
+    if not re.fullmatch(r"v[0-9A-Za-z._-]+", value, re.I):
+        raise ValueError(
+            "Invalid release version. Use a value such as 0.77.1 or v0.77.1."
+        )
+
+    return value
+
+
+def _standardize_release_assets(raw_assets: List[Dict]) -> List[Dict]:
+    """Converts GitHub API asset records to the script's internal format."""
+    out: List[Dict] = []
+    for asset in raw_assets or []:
+        name = asset.get("name", "")
+        url = asset.get("browser_download_url", "")
+        if not name or not url:
+            continue
         out.append({
-            "name": a.get("name", ""),                      # Filename (e.g., "velociraptor-v0.74.1-windows-amd64.exe")
-            "url": a.get("browser_download_url", ""),       # Direct download URL
-            "content_type": a.get("content_type", ""),      # MIME type
-            "size": a.get("size", 0),                       # File size in bytes
+            "name": name,
+            "url": url,
+            "content_type": asset.get("content_type", ""),
+            "size": asset.get("size", 0),
         })
-    return tag, out
+    return out
 
-def get_latest_assets_scrape() -> Tuple[str, List[Dict]]:
+
+def get_release_assets_api(
+    token: Optional[str],
+    requested_tag: Optional[str] = None
+) -> Tuple[str, List[Dict], str]:
     """
-    Fallback method to get release information by scraping GitHub releases page.
-
-    Used when GitHub API is unavailable or rate-limited. Less reliable than API
-    but provides basic functionality for downloading releases.
+    Retrieves either the latest stable release or a specific release by tag.
 
     Returns:
-        Tuple[str, List[Dict]]: (release_tag, list_of_asset_dictionaries)
+        Tuple[str, List[Dict], str]:
+            release tag, asset list, and GitHub release page URL.
     """
+    import urllib.parse
+
+    if requested_tag and requested_tag.lower() != "latest":
+        encoded_tag = urllib.parse.quote(requested_tag, safe="")
+        api_url = API_RELEASE_BY_TAG.format(tag=encoded_tag)
+    else:
+        api_url = API_LATEST
+
+    data = request_json(api_url, token=token)
+    tag = data.get("tag_name") or requested_tag or "latest"
+    assets = _standardize_release_assets(data.get("assets", []) or [])
+    release_url = (
+        data.get("html_url")
+        or f"{HTML_RELEASES}/tag/{urllib.parse.quote(tag, safe='')}"
+    )
+    return tag, assets, release_url
+
+
+def get_release_assets_scrape(
+    requested_tag: Optional[str] = None
+) -> Tuple[str, List[Dict], str]:
+    """
+    Fallback release discovery through GitHub HTML when the API is unavailable.
+    """
+    import urllib.parse
     import urllib.request
 
-    # Download the GitHub releases page HTML
-    html_text = urllib.request.urlopen(HTML_RELEASES, timeout=30).read().decode("utf-8", "ignore")
+    if requested_tag and requested_tag.lower() != "latest":
+        tag = requested_tag
+        release_url = f"{HTML_RELEASES}/tag/{urllib.parse.quote(tag, safe='')}"
+    else:
+        release_url = f"{HTML_RELEASES}/latest"
+        tag = "latest"
 
-    # Extract the latest release tag from HTML using regex
-    tag_match = re.search(r'/releases/tag/([^"\'<> ]+)', html_text, re.I)
-    tag = tag_match.group(1) if tag_match else "latest"
+    request = urllib.request.Request(
+        release_url,
+        headers={"User-Agent": "Velociraptor-Client-Builder"}
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        final_url = response.geturl()
+        html_text = response.read().decode("utf-8", "ignore")
 
-    # Find all download links for this release
-    assets = []
-    for m in re.finditer(rf'/download/{re.escape(tag)}/([^"\'<> ]+)', html_text, re.I):
-        name = html.unescape(m.group(1))  # Decode HTML entities in filename
+    if tag == "latest":
+        tag_match = re.search(r"/releases/tag/([^/?#]+)", final_url, re.I)
+        if not tag_match:
+            tag_match = re.search(r'/releases/tag/([^"\'<> ]+)', html_text, re.I)
+        tag = tag_match.group(1) if tag_match else "latest"
+        release_url = f"{HTML_RELEASES}/tag/{urllib.parse.quote(tag, safe='')}"
+
+    assets: List[Dict] = []
+    seen = set()
+    pattern = rf"/download/{re.escape(tag)}/([^\"'<>?\s]+)"
+
+    for match in re.finditer(pattern, html_text, re.I):
+        name = html.unescape(match.group(1))
         url = f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/{name}"
+        if url in seen:
+            continue
+        seen.add(url)
         assets.append({
             "name": name,
             "url": url,
-            "content_type": "",  # Not available from HTML scraping
-            "size": 0           # Not available from HTML scraping
+            "content_type": "",
+            "size": 0,
         })
-    return tag, assets
+
+    return tag, assets, release_url
+
+
+def retrieve_release(
+    token: Optional[str],
+    requested_tag: Optional[str] = None
+) -> Tuple[str, List[Dict], str]:
+    """Retrieves a release through the API, then falls back to HTML scraping."""
+    try:
+        return get_release_assets_api(
+            token=token,
+            requested_tag=requested_tag
+        )
+    except Exception as api_error:
+        target = requested_tag or "latest"
+        print(
+            f"[!] GitHub API lookup failed for {target}: {api_error}\n"
+            "    Falling back to the GitHub releases page..."
+        )
+        return get_release_assets_scrape(requested_tag=requested_tag)
+
+
+def select_release(
+    token: Optional[str],
+    requested_version: Optional[str] = None
+) -> Tuple[str, List[Dict], str]:
+    """
+    Shows the latest stable release and lets the operator either use it or enter
+    a specific version. A supplied --version skips the prompt.
+    """
+    latest_tag, latest_assets, latest_url = retrieve_release(token=token)
+
+    print("\nGitHub release information")
+    print("--------------------------")
+    print(f"Latest stable release : {latest_tag}")
+    print(f"Latest release page   : {latest_url}")
+
+    if requested_version:
+        requested_tag = normalize_release_tag(requested_version)
+        if requested_tag.lower() == "latest":
+            print(f"Selected release      : {latest_tag}")
+            return latest_tag, latest_assets, latest_url
+
+        tag, assets, release_url = retrieve_release(
+            token=token,
+            requested_tag=requested_tag
+        )
+        if not assets:
+            raise RuntimeError(
+                f"Release {tag} was found, but no downloadable assets were discovered."
+            )
+
+        print(f"Requested release     : {tag}")
+        print(f"Requested release page: {release_url}")
+        return tag, assets, release_url
+
+    print("\nChoose release source:")
+    print(f"1) Use latest stable release ({latest_tag})")
+    print("2) Enter a specific version")
+
+    while True:
+        choice = input("Enter number [1-2]: ").strip()
+
+        if choice == "1":
+            if not latest_assets:
+                print("[!] No downloadable assets were found for the latest release.")
+                continue
+            print(f"[*] Selected release: {latest_tag}")
+            print(f"[*] GitHub release:   {latest_url}")
+            return latest_tag, latest_assets, latest_url
+
+        if choice == "2":
+            version_input = input(
+                "Enter version (example: 0.77.1 or v0.77.1): "
+            ).strip()
+            try:
+                requested_tag = normalize_release_tag(version_input)
+                if requested_tag.lower() == "latest":
+                    if not latest_assets:
+                        print("[!] No downloadable assets were found for the latest release.")
+                        continue
+                    return latest_tag, latest_assets, latest_url
+
+                tag, assets, release_url = retrieve_release(
+                    token=token,
+                    requested_tag=requested_tag
+                )
+
+                if not assets:
+                    print(
+                        f"[!] Release {tag} did not return downloadable assets. "
+                        "Check the version and try again."
+                    )
+                    continue
+
+                print(f"[*] Selected release: {tag}")
+                print(f"[*] GitHub release:   {release_url}")
+                return tag, assets, release_url
+            except Exception as error:
+                print(f"[!] Could not retrieve that release: {error}")
+                continue
+
+        print("Invalid choice, try again.")
+
 
 def filter_assets_for_os(assets: List[Dict], os_key: str) -> List[Dict]:
     """
@@ -337,7 +508,10 @@ def pick_from_numbered(items: List[Dict]) -> Dict:
     while True:
         choice = input("\nEnter the number to download: ").strip()
         if choice.isdigit() and 1 <= int(choice) <= len(items):
-            return items[int(choice) - 1]  # Return selected asset (convert to 0-based index)
+            selected = items[int(choice) - 1]
+            print(f"[*] Selected GitHub asset: {selected['name']}")
+            print(f"[*] Download URL:          {selected['url']}")
+            return selected  # Convert the numbered choice to the selected asset
         print("Invalid choice, try again.")
 
 def download(asset: Dict, outdir: Path) -> Path:
@@ -712,6 +886,14 @@ def main():
     ap = argparse.ArgumentParser(description="Velociraptor client builder/publisher")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP server port (default 9999)")
     ap.add_argument("--token", help="GitHub token (optional)")
+    ap.add_argument(
+        "--version", "--release",
+        dest="release_version",
+        help=(
+            "Release to build, for example 0.77.1 or v0.77.1. "
+            "Omit it to use the numbered release-selection menu."
+        )
+    )
     ap.add_argument("--no-httpd", action="store_true",
                     help="Do NOT install/start the background web server (override default)")
     ap.add_argument("--serve-only", action="store_true",
@@ -748,14 +930,24 @@ def main():
             break
         print("Invalid choice.")
 
-    # Get the assets list
+    # Show the current latest release, then use either that release or a
+    # specific version selected by the operator.
     try:
-        tag, assets = get_latest_assets_api(token=args.token)
-    except Exception as e:
-        print(f"[!] GitHub API failed: {e}\n    Falling back to HTML scrape…")
-        tag, assets = get_latest_assets_scrape()
+        tag, assets, release_url = select_release(
+            token=args.token,
+            requested_version=args.release_version
+        )
+    except Exception as error:
+        sys.exit(f"ERROR: Could not retrieve GitHub release assets: {error}")
+
     if not assets:
         sys.exit("ERROR: Could not retrieve release assets.")
+
+    print("\nSelected GitHub release")
+    print("-----------------------")
+    print(f"Tag          : {tag}")
+    print(f"Release page : {release_url}")
+    print(f"Assets found : {len(assets)}")
 
     # Ask for client.config.yaml
     while True:
