@@ -28,13 +28,19 @@ Keeps certificates whose subject, issuer, or friendly name contains Velociraptor
 
 [CmdletBinding()]
 param(
-    [switch]$Force,
-    [switch]$IncludeHistory,
-    [switch]$SkipCertificateRemoval
+    [switch]$Force,                  # Compatibility only; cleanup is always forced.
+    [switch]$IncludeHistory,         # Compatibility only; history cleanup is now default.
+    [switch]$SkipHistory,            # Disable Velociraptor-related history cleanup.
+    [switch]$SkipCertificateRemoval, # Keep matching certificates.
+    [switch]$RestartWhenDone         # Restart automatically after successful cleanup.
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+$ScriptVersion = '2.0.0-silent-scale'
+$ScriptName = 'VDA Client Cleanup'
 
 $script:RemovedCount = 0
 $script:Warnings = @()
@@ -82,8 +88,33 @@ function Remove-PathPattern {
             continue
         }
 
-        try {
-            Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
+        $removed = $false
+        for ($attempt = 1; $attempt -le 3 -and -not $removed; $attempt++) {
+            try {
+                if ($item.PSIsContainer) {
+                    Get-ChildItem -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue |
+                        ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
+                }
+                else {
+                    try { $item.Attributes = 'Normal' } catch {}
+                }
+
+                Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
+                $removed = $true
+            }
+            catch {
+                if ($attempt -eq 1) {
+                    try {
+                        & "$env:SystemRoot\System32\takeown.exe" /F $item.FullName /A /R /D Y 2>$null | Out-Null
+                        & "$env:SystemRoot\System32\icacls.exe" $item.FullName /grant '*S-1-5-32-544:(OI)(CI)F' /T /C /Q 2>$null | Out-Null
+                    }
+                    catch {}
+                }
+                Start-Sleep -Milliseconds 500
+            }
+        }
+
+        if ($removed) {
             if ($Description) {
                 Write-Removed "$Description`: $($item.FullName)"
             }
@@ -91,8 +122,8 @@ function Remove-PathPattern {
                 Write-Removed $item.FullName
             }
         }
-        catch {
-            Write-WarningRecord "Could not remove '$($item.FullName)': $($_.Exception.Message)"
+        else {
+            Write-WarningRecord "Could not remove '$($item.FullName)' after three attempts. It may require a restart."
         }
     }
 }
@@ -140,20 +171,46 @@ function Remove-MatchingRegistryValues {
     }
 }
 
-if (-not (Test-IsAdministrator)) {
-    throw 'Run this script from Windows PowerShell as Administrator.'
+if (-not $PSCommandPath) {
+    throw 'Save this content as a .ps1 file and run it with -File. Do not paste the script body into an interactive PowerShell prompt.'
 }
 
-Write-Host 'Velociraptor complete cleanup' -ForegroundColor Yellow
-Write-Host 'This removes the active installation and common local leftovers.' -ForegroundColor Yellow
+if (-not (Test-IsAdministrator)) {
+    Write-Host '[INFO] Administrator rights are required. Attempting self-elevation...' -ForegroundColor Yellow
 
-if (-not $Force) {
-    $confirmation = Read-Host 'Type REMOVE to continue'
-    if ($confirmation -cne 'REMOVE') {
-        Write-Host 'Cleanup cancelled.' -ForegroundColor Yellow
-        exit 1
+    $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $elevationArgs = @(
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', ('"{0}"' -f $PSCommandPath)
+    )
+
+    if ($Force)                  { $elevationArgs += '-Force' }
+    if ($IncludeHistory)         { $elevationArgs += '-IncludeHistory' }
+    if ($SkipHistory)            { $elevationArgs += '-SkipHistory' }
+    if ($SkipCertificateRemoval) { $elevationArgs += '-SkipCertificateRemoval' }
+    if ($RestartWhenDone)        { $elevationArgs += '-RestartWhenDone' }
+
+    try {
+        $elevatedProcess = Start-Process -FilePath $powerShellExe `
+            -ArgumentList $elevationArgs `
+            -Verb RunAs `
+            -Wait `
+            -PassThru `
+            -ErrorAction Stop
+        exit $elevatedProcess.ExitCode
+    }
+    catch {
+        Write-Error "Automatic elevation failed: $($_.Exception.Message)"
+        exit 5
     }
 }
+
+Write-Host "$ScriptName $ScriptVersion" -ForegroundColor Yellow
+Write-Host 'Running unattended cleanup. No confirmation is required.' -ForegroundColor Yellow
+Write-Host 'Only Velociraptor-related active components and common leftovers are targeted.' -ForegroundColor Yellow
 
 # ---------------------------------------------------------------------------
 # 1. Stop Velociraptor processes
@@ -523,6 +580,9 @@ $knownRegistryKeys = @(
     'HKLM:\SOFTWARE\Velociraptor',
     'HKLM:\SOFTWARE\WOW6432Node\Velociraptor',
     'HKCU:\SOFTWARE\Velociraptor',
+    'HKLM:\SOFTWARE\Velocidex\Velociraptor',
+    'HKLM:\SOFTWARE\WOW6432Node\Velocidex\Velociraptor',
+    'HKCU:\SOFTWARE\Velocidex\Velociraptor',
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\velociraptor.exe',
     'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\velociraptor.exe'
 )
@@ -720,7 +780,7 @@ foreach ($tempRoot in @($tempRoots | Where-Object { Test-Path -LiteralPath $_ } 
 # ---------------------------------------------------------------------------
 Write-Section 'PowerShell history'
 
-if ($IncludeHistory) {
+if (-not $SkipHistory) {
     try {
         Clear-History -ErrorAction SilentlyContinue
     }
@@ -755,7 +815,7 @@ if ($IncludeHistory) {
     }
 }
 else {
-    Write-Skip 'History cleanup not requested. Use -IncludeHistory to enable it.'
+    Write-Skip 'History cleanup was disabled with -SkipHistory.'
 }
 
 # ---------------------------------------------------------------------------
@@ -814,6 +874,12 @@ foreach ($path in $verificationPaths) {
     }
 }
 
+foreach ($registryPath in $knownRegistryKeys) {
+    if (Test-Path -LiteralPath $registryPath) {
+        $remaining += "Registry key: $registryPath"
+    }
+}
+
 foreach ($root in $uninstallRoots) {
     if (-not (Test-Path -LiteralPath $root)) {
         continue
@@ -860,3 +926,10 @@ Write-Host "`nRestart Windows to release any files that were locked during clean
     -ForegroundColor Cyan
 Write-Host 'For a truly pristine/forensically clean machine, use Reset this PC or reimage Windows.' `
     -ForegroundColor Cyan
+
+if ($RestartWhenDone) {
+    Write-Host '[INFO] Restarting Windows in 15 seconds...' -ForegroundColor Cyan
+    shutdown.exe /r /t 15 /f /c "Velociraptor cleanup completed"
+}
+
+exit 0
