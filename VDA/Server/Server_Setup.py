@@ -60,9 +60,11 @@ from typing import Dict, List, Optional, Tuple  # Type hints for better code cla
 # These constants define the behavior and settings of the script
 
 # GitHub repository information for downloading Velociraptor releases
+SCRIPT_VERSION = "2.1.0-release-url"
 GITHUB_REPO = "Velocidex/velociraptor"                                    # Official Velociraptor repository
 API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"  # Latest stable release
 API_RELEASE_BY_TAG = f"https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{{tag}}"  # Specific release
+API_RELEASE_ASSETS = f"https://api.github.com/repos/{GITHUB_REPO}/releases/{{release_id}}/assets"  # Paginated assets
 HTML_RELEASES = f"https://github.com/{GITHUB_REPO}/releases"             # GitHub releases page
 
 # Server configuration
@@ -212,38 +214,95 @@ def request_json(url: str, token: Optional[str] = None) -> Dict:
 
 def normalize_release_tag(value: str) -> str:
     """
-    Normalizes operator input into a GitHub release tag.
+    Normalize a version or pasted GitHub release URL into a release tag.
 
     Accepted examples:
         0.77.1
         v0.77.1
-        https://github.com/Velocidex/velociraptor/releases/tag/v0.77.1
+        v0.74
+        https://github.com/Velocidex/velociraptor/releases/tag/v0.74
+        https://github.com/Velocidex/velociraptor/releases#release-v0.74
     """
-    value = value.strip().rstrip("/")
-    if not value:
-        raise ValueError("Release version cannot be empty.")
+    import urllib.parse
 
-    # Accept a copied GitHub release URL.
-    if "/releases/tag/" in value:
+    value = value.strip()
+    if not value:
+        raise ValueError("Release version or GitHub release URL cannot be empty.")
+
+    parsed = urllib.parse.urlparse(value)
+
+    # GitHub release-family links use an anchor such as #release-v0.74.
+    if parsed.fragment.lower().startswith("release-"):
+        value = urllib.parse.unquote(parsed.fragment[len("release-"):])
+
+    # Normal GitHub release links use /releases/tag/<tag>.
+    elif "/releases/tag/" in parsed.path:
+        value = parsed.path.split("/releases/tag/", 1)[1].split("/", 1)[0]
+        value = urllib.parse.unquote(value)
+
+    # Also accept copied text containing either URL form.
+    elif "#release-" in value:
+        value = value.split("#release-", 1)[1].split("/", 1)[0]
+    elif "/releases/tag/" in value:
         value = value.split("/releases/tag/", 1)[1].split("/", 1)[0]
+    elif value.lower().startswith("release-"):
+        value = value[len("release-"):]
+
+    value = urllib.parse.unquote(value.strip().strip("/"))
 
     if value.lower() == "latest":
         return "latest"
 
-    # Velociraptor release tags normally begin with "v".
+    # Correct common typing variants such as v.74 and .74.1.
+    value = re.sub(r"^v\.", "v0.", value, flags=re.I)
+    value = re.sub(r"^\.", "0.", value)
+
     if re.match(r"^\d", value):
         value = f"v{value}"
 
-    if not re.fullmatch(r"v[0-9A-Za-z._-]+", value, re.I):
+    if not re.fullmatch(r"v\d+(?:\.\d+)+(?:[-._][A-Za-z0-9]+)*", value, re.I):
         raise ValueError(
-            "Invalid release version. Use a value such as 0.77.1 or v0.77.1."
+            "Invalid release value. Enter a version such as 0.74.1 or paste a GitHub release URL."
         )
 
     return value
 
 
+def release_family_tag(tag: str) -> Optional[str]:
+    """Return v0.74 for a package version such as v0.74.1."""
+    match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(?:[-._].*)?", tag, re.I)
+    if not match:
+        return None
+    return f"v{match.group(1)}.{match.group(2)}"
+
+
+def filter_assets_for_requested_version(
+    assets: List[Dict],
+    requested_tag: Optional[str]
+) -> List[Dict]:
+    """
+    If a package version such as v0.74.1 was requested from family release
+    v0.74, retain only assets whose filename contains that package version.
+    """
+    if not requested_tag or requested_tag.lower() == "latest":
+        return assets
+
+    match = re.fullmatch(
+        r"v(\d+\.\d+\.\d+(?:[-._][A-Za-z0-9]+)*)",
+        requested_tag,
+        re.I,
+    )
+    if not match:
+        return assets
+
+    version = match.group(1)
+    pattern = re.compile(rf"(?<!\d)v?{re.escape(version)}(?!\d)", re.I)
+    matching = [a for a in assets if pattern.search(a.get("name", ""))]
+    return matching
+
+
 def _standardize_release_assets(raw_assets: List[Dict]) -> List[Dict]:
-    """Converts GitHub API asset records to the script's internal format."""
+    """Convert GitHub API asset records to the script's internal format."""
     out: List[Dict] = []
     for asset in raw_assets or []:
         name = asset.get("name", "")
@@ -259,17 +318,37 @@ def _standardize_release_assets(raw_assets: List[Dict]) -> List[Dict]:
     return out
 
 
+def list_all_release_assets_api(
+    release_id: int,
+    token: Optional[str]
+) -> List[Dict]:
+    """Retrieve all release assets using GitHub API pagination."""
+    all_assets: List[Dict] = []
+    page = 1
+    per_page = 100
+
+    while True:
+        url = (
+            f"{API_RELEASE_ASSETS.format(release_id=release_id)}"
+            f"?per_page={per_page}&page={page}"
+        )
+        batch = request_json(url, token=token)
+        if not isinstance(batch, list):
+            raise RuntimeError("GitHub returned an invalid release-assets response.")
+
+        all_assets.extend(batch)
+        if len(batch) < per_page:
+            break
+        page += 1
+
+    return all_assets
+
+
 def get_release_assets_api(
     token: Optional[str],
     requested_tag: Optional[str] = None
 ) -> Tuple[str, List[Dict], str]:
-    """
-    Retrieves either the latest stable release or a specific release by tag.
-
-    Returns:
-        Tuple[str, List[Dict], str]:
-            release tag, asset list, and GitHub release page URL.
-    """
+    """Retrieve latest or specific release metadata and every attached asset."""
     import urllib.parse
 
     if requested_tag and requested_tag.lower() != "latest":
@@ -279,8 +358,18 @@ def get_release_assets_api(
         api_url = API_LATEST
 
     data = request_json(api_url, token=token)
+    if not isinstance(data, dict):
+        raise RuntimeError("GitHub returned an invalid release response.")
+
     tag = data.get("tag_name") or requested_tag or "latest"
-    assets = _standardize_release_assets(data.get("assets", []) or [])
+    release_id = data.get("id")
+
+    if release_id is not None:
+        raw_assets = list_all_release_assets_api(int(release_id), token=token)
+    else:
+        raw_assets = data.get("assets", []) or []
+
+    assets = _standardize_release_assets(raw_assets)
     release_url = (
         data.get("html_url")
         or f"{HTML_RELEASES}/tag/{urllib.parse.quote(tag, safe='')}"
@@ -291,9 +380,7 @@ def get_release_assets_api(
 def get_release_assets_scrape(
     requested_tag: Optional[str] = None
 ) -> Tuple[str, List[Dict], str]:
-    """
-    Fallback release discovery through GitHub HTML when the API is unavailable.
-    """
+    """Fallback release discovery through GitHub HTML."""
     import urllib.parse
     import urllib.request
 
@@ -306,7 +393,7 @@ def get_release_assets_scrape(
 
     request = urllib.request.Request(
         release_url,
-        headers={"User-Agent": "Velociraptor-Client-Builder"}
+        headers={"User-Agent": "Velociraptor-Client-Builder"},
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         final_url = response.geturl()
@@ -343,58 +430,105 @@ def retrieve_release(
     token: Optional[str],
     requested_tag: Optional[str] = None
 ) -> Tuple[str, List[Dict], str]:
-    """Retrieves a release through the API, then falls back to HTML scraping."""
-    try:
-        return get_release_assets_api(
-            token=token,
-            requested_tag=requested_tag
-        )
-    except Exception as api_error:
-        target = requested_tag or "latest"
-        print(
-            f"[!] GitHub API lookup failed for {target}: {api_error}\n"
-            "    Falling back to the GitHub releases page..."
-        )
-        return get_release_assets_scrape(requested_tag=requested_tag)
+    """
+    Retrieve through the API, with HTML fallback. If v0.74.1 is not a
+    standalone release tag, automatically retry the family release v0.74.
+    """
+    candidates: List[Optional[str]] = [requested_tag]
+
+    if requested_tag and requested_tag.lower() != "latest":
+        family = release_family_tag(requested_tag)
+        if family and family.lower() != requested_tag.lower():
+            candidates.append(family)
+
+    api_errors: List[str] = []
+    for candidate in candidates:
+        try:
+            result = get_release_assets_api(token=token, requested_tag=candidate)
+            if candidate != requested_tag and candidate is not None:
+                print(
+                    f"[*] Package version {requested_tag} is stored under "
+                    f"GitHub release family {candidate}."
+                )
+            return result
+        except Exception as error:
+            api_errors.append(f"{candidate or 'latest'}: {error}")
+
+    print(
+        "[!] GitHub API lookup failed:\n    "
+        + "\n    ".join(api_errors)
+        + "\n    Falling back to GitHub HTML..."
+    )
+
+    html_errors: List[str] = []
+    for candidate in candidates:
+        try:
+            result = get_release_assets_scrape(requested_tag=candidate)
+            if candidate != requested_tag and candidate is not None:
+                print(
+                    f"[*] Package version {requested_tag} is stored under "
+                    f"GitHub release family {candidate}."
+                )
+            return result
+        except Exception as error:
+            html_errors.append(f"{candidate or 'latest'}: {error}")
+
+    raise RuntimeError(
+        "Could not retrieve the requested GitHub release. " + " | ".join(html_errors)
+    )
 
 
 def select_release(
     token: Optional[str],
     requested_version: Optional[str] = None
 ) -> Tuple[str, List[Dict], str]:
-    """
-    Shows the latest stable release and lets the operator either use it or enter
-    a specific version. A supplied --version skips the prompt.
-    """
+    """Show latest release, or accept a version or pasted GitHub release URL."""
     latest_tag, latest_assets, latest_url = retrieve_release(token=token)
 
     print("\nGitHub release information")
     print("--------------------------")
     print(f"Latest stable release : {latest_tag}")
     print(f"Latest release page   : {latest_url}")
+    print(f"Latest release assets : {len(latest_assets)}")
 
-    if requested_version:
-        requested_tag = normalize_release_tag(requested_version)
+    def resolve(value: str) -> Tuple[str, List[Dict], str]:
+        requested_tag = normalize_release_tag(value)
         if requested_tag.lower() == "latest":
-            print(f"Selected release      : {latest_tag}")
             return latest_tag, latest_assets, latest_url
 
-        tag, assets, release_url = retrieve_release(
+        tag, release_assets, release_url = retrieve_release(
             token=token,
-            requested_tag=requested_tag
+            requested_tag=requested_tag,
         )
-        if not assets:
+        matching_assets = filter_assets_for_requested_version(
+            release_assets,
+            requested_tag,
+        )
+
+        print(f"[*] Requested input       : {value}")
+        print(f"[*] GitHub release family : {tag}")
+        print(f"[*] Release page          : {release_url}")
+        print(f"[*] Total release assets  : {len(release_assets)}")
+
+        if requested_tag != tag:
+            print(f"[*] Requested package tag : {requested_tag}")
+            print(f"[*] Matching assets       : {len(matching_assets)}")
+
+        if not matching_assets:
             raise RuntimeError(
-                f"Release {tag} was found, but no downloadable assets were discovered."
+                f"Release {tag} exists, but no assets match package version {requested_tag}."
             )
 
-        print(f"Requested release     : {tag}")
-        print(f"Requested release page: {release_url}")
-        return tag, assets, release_url
+        return tag, matching_assets, release_url
+
+    if requested_version:
+        return resolve(requested_version)
 
     print("\nChoose release source:")
     print(f"1) Use latest stable release ({latest_tag})")
-    print("2) Enter a specific version")
+    print("2) Enter a package version or paste a GitHub release URL")
+    print("   Example version: 0.74.1")
+    print("   Example URL: https://github.com/velocidex/velociraptor/releases#release-v0.74")
 
     while True:
         choice = input("Enter number [1-2]: ").strip()
@@ -405,35 +539,13 @@ def select_release(
                 continue
             print(f"[*] Selected release: {latest_tag}")
             print(f"[*] GitHub release:   {latest_url}")
+            print(f"[*] Release assets:   {len(latest_assets)}")
             return latest_tag, latest_assets, latest_url
 
         if choice == "2":
-            version_input = input(
-                "Enter version (example: 0.77.1 or v0.77.1): "
-            ).strip()
+            value = input("Paste version or GitHub release URL: ").strip()
             try:
-                requested_tag = normalize_release_tag(version_input)
-                if requested_tag.lower() == "latest":
-                    if not latest_assets:
-                        print("[!] No downloadable assets were found for the latest release.")
-                        continue
-                    return latest_tag, latest_assets, latest_url
-
-                tag, assets, release_url = retrieve_release(
-                    token=token,
-                    requested_tag=requested_tag
-                )
-
-                if not assets:
-                    print(
-                        f"[!] Release {tag} did not return downloadable assets. "
-                        "Check the version and try again."
-                    )
-                    continue
-
-                print(f"[*] Selected release: {tag}")
-                print(f"[*] GitHub release:   {release_url}")
-                return tag, assets, release_url
+                return resolve(value)
             except Exception as error:
                 print(f"[!] Could not retrieve that release: {error}")
                 continue
@@ -883,6 +995,8 @@ def linux_flow(vr_bin: str, dist_root: Path, client_cfg: Path,
 # -------------------- main ----------------------------------------------
 
 def main():
+    print(f"Velociraptor Client Builder {SCRIPT_VERSION}")
+    print("=" * 50)
     ap = argparse.ArgumentParser(description="Velociraptor client builder/publisher")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP server port (default 9999)")
     ap.add_argument("--token", help="GitHub token (optional)")
@@ -890,7 +1004,8 @@ def main():
         "--version", "--release",
         dest="release_version",
         help=(
-            "Release to build, for example 0.77.1 or v0.77.1. "
+            "Package version or GitHub release URL, for example 0.74.1, v0.74, "
+            "or https://github.com/velocidex/velociraptor/releases#release-v0.74. "
             "Omit it to use the numbered release-selection menu."
         )
     )
